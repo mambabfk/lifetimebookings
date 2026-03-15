@@ -449,10 +449,15 @@ def _book_on_details_page(page: Page, details_url: str, poll_timeout_seconds: in
 
 def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingResult]:
     """
-    For each target date within the horizon:
-      - load the schedule page
-      - find all sessions matching keywords that are bookable
-      - book them all (or report in dry-run mode)
+    Two-phase execution:
+
+    Phase 1 — Discovery (fast, schedule pages only):
+      Scan every target date, collect all bookable sessions and their open times.
+      The browser then goes completely idle — no further requests are made.
+
+    Phase 2 — Sleep until 60s before the earliest registration opens, then book:
+      Navigate to each class detail page and use wait_for_function to react the
+      millisecond the Reserve button becomes clickable.
     """
     results: List[BookingResult] = []
     targets = _target_dates(cfg)
@@ -461,7 +466,11 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
         logger.info("No target dates found within the booking horizon.")
         return results
 
+    # ------------------------------------------------------------------
+    # Phase 1: Discovery
+    # ------------------------------------------------------------------
     existing_reservations = _fetch_existing_reservations(page)
+    all_sessions: List[Tuple[date, str, str, str]] = []  # (date, name, url, text)
 
     for target_date in targets:
         logger.info("Checking %s (%s)...", target_date, target_date.strftime("%A"))
@@ -476,35 +485,71 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
             continue
 
         for session_name, details_url, session_text in sessions:
-            if dry_run:
-                results.append(BookingResult(
-                    target_date=target_date,
-                    session_name=session_name,
-                    success=True,
-                    message="[DRY RUN] Session found but not booked.",
-                    dry_run=True,
-                ))
-                logger.info("  [DRY RUN] %s — available: %s", target_date, session_name)
-                continue
+            all_sessions.append((target_date, session_name, details_url, session_text))
 
-            logger.info("  Booking %s — %s...", target_date, session_name)
-            booked = _book_on_details_page(page, details_url)
+    if not all_sessions:
+        return results
+
+    # Dry-run: report and exit without booking
+    if dry_run:
+        for target_date, session_name, _, _ in all_sessions:
             results.append(BookingResult(
                 target_date=target_date,
                 session_name=session_name,
-                success=booked,
-                message="Booking confirmed." if booked else "Booking failed.",
+                success=True,
+                message="[DRY RUN] Session found but not booked.",
+                dry_run=True,
             ))
+            logger.info("  [DRY RUN] %s — available: %s", target_date, session_name)
+        return results
 
-            if booked:
-                logger.info("  SUCCESS: %s — %s", target_date, session_name)
-                existing_reservations.add(session_name.lower())
-                start_dt = _parse_session_start(session_text, target_date)
-                end_dt = _parse_session_end(session_text, target_date)
-                add_to_calendar(
-                    session_name, start_dt, end_dt, timezone=cfg.calendar_timezone
-                )
-            else:
-                logger.warning("  FAILED: %s — %s", target_date, session_name)
+    # ------------------------------------------------------------------
+    # Sleep until 60 seconds before the earliest registration opens.
+    # Registration for a session opens at: session_start - 7 days - 22 hours.
+    # The browser is completely idle during this wait — no requests made.
+    # ------------------------------------------------------------------
+    open_times = []
+    for target_date, _, _, session_text in all_sessions:
+        start_dt = _parse_session_start(session_text, target_date)
+        if start_dt is not None:
+            open_times.append(start_dt - timedelta(days=7, hours=22))
+
+    if open_times:
+        earliest_open = min(open_times)
+        wake_time = earliest_open - timedelta(seconds=60)
+        wait_secs = (wake_time - datetime.now()).total_seconds()
+
+        if wait_secs > 0:
+            logger.info(
+                "Discovery complete. Registration opens at %s. "
+                "Browser idle — sleeping %.0fs until %s (60s early).",
+                earliest_open.strftime("%Y-%m-%d %I:%M:%S %p"),
+                wait_secs,
+                wake_time.strftime("%I:%M:%S %p"),
+            )
+            _time.sleep(wait_secs)
+            logger.info("Waking up — navigating to class detail pages now.")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Booking
+    # ------------------------------------------------------------------
+    for target_date, session_name, details_url, session_text in all_sessions:
+        logger.info("  Booking %s — %s...", target_date, session_name)
+        booked = _book_on_details_page(page, details_url)
+        results.append(BookingResult(
+            target_date=target_date,
+            session_name=session_name,
+            success=booked,
+            message="Booking confirmed." if booked else "Booking failed.",
+        ))
+
+        if booked:
+            logger.info("  SUCCESS: %s — %s", target_date, session_name)
+            existing_reservations.add(session_name.lower())
+            start_dt = _parse_session_start(session_text, target_date)
+            end_dt = _parse_session_end(session_text, target_date)
+            add_to_calendar(session_name, start_dt, end_dt, timezone=cfg.calendar_timezone)
+        else:
+            logger.warning("  FAILED: %s — %s", target_date, session_name)
 
     return results
