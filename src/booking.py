@@ -289,14 +289,26 @@ def _find_matching_sessions(
 
 
 # ---------------------------------------------------------------------------
-# Participant selection
+# Participant selection + spinner wait
 # ---------------------------------------------------------------------------
+
+def _wait_for_spinner(page: Page, timeout_ms: int = 5000) -> None:
+    """Wait for any loading spinner to disappear before interacting with the page."""
+    try:
+        page.wait_for_selector(
+            '[class*="spinner"], [class*="loading"], [class*="loader"]',
+            state="hidden",
+            timeout=timeout_ms,
+        )
+    except Exception:
+        pass  # no spinner found or already gone
+
 
 def _select_participant(page: Page) -> None:
     """
-    Check Tim's checkbox, uncheck Mark's.
-    Uses JS to set checked state + dispatch change event so Vue/React picks it up.
-    Bypasses CSS visibility/disabled constraints.
+    Ensure Tim is checked and Mark is unchecked.
+    Only acts on checkboxes that are in the wrong state — avoids
+    dispatching events that could reset a pre-selected form.
     """
     for cb in page.locator('[data-testid="participantCheckBox"]').all():
         try:
@@ -306,13 +318,16 @@ def _select_participant(page: Page) -> None:
             }""").lower()
             is_checked = cb.is_checked()
 
-            if "tim" in label and not is_checked:
-                cb.evaluate("""el => {
-                    el.checked = true;
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                }""")
-                logger.debug("Selected participant: Tim")
+            if "tim" in label:
+                if not is_checked:
+                    cb.evaluate("""el => {
+                        el.checked = true;
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }""")
+                    logger.debug("Selected participant: Tim")
+                else:
+                    logger.debug("Participant Tim already selected — leaving as-is")
             elif "mark" in label and is_checked:
                 cb.evaluate("""el => {
                     el.checked = false;
@@ -356,9 +371,10 @@ def _get_registration_open_time(page: Page) -> Optional[datetime]:
 
 def _try_click_reserve(page: Page) -> bool:
     """
-    Select Tim and click the Reserve button if it's currently available.
+    Wait for spinner, verify Tim is selected, then click Reserve if available.
     Returns True if booking confirmed, False otherwise.
     """
+    _wait_for_spinner(page)
     _select_participant(page)
     for btn in page.locator('[data-testid="reserveButton"]').all():
         try:
