@@ -70,8 +70,9 @@ def main() -> int:
 
     mode = "DRY RUN" if args.dry_run else "LIVE"
     logger.info("=== Lifetime Pickleball Booker starting (%s) ===", mode)
-    logger.info("Club: %s | Sport: %s | Days: %s | Times: %s",
-                cfg.club_name, cfg.sport, cfg.preferred_days, cfg.preferred_times)
+    logger.info("Club: %s | Sport: %s | Days: %s | Keywords: %s | Exclusions: %s",
+                cfg.club_name, cfg.sport, cfg.preferred_days,
+                cfg.session_keywords, cfg.session_exclusions)
 
     pw = None
     browser = None
@@ -104,15 +105,15 @@ def main() -> int:
         logger.info("--- DRY RUN RESULTS ---")
         if dry_run_found:
             for r in dry_run_found:
-                logger.info("  AVAILABLE: %s @ %s", r.target_date, r.target_time)
+                logger.info("  AVAILABLE: %s — %s", r.target_date, r.session_name)
         else:
-            logger.info("  No available slots found matching your preferences.")
+            logger.info("  No available sessions found matching your keywords.")
     else:
         logger.info("--- BOOKING RESULTS ---")
         for r in successes:
-            logger.info("  BOOKED: %s @ %s", r.target_date, r.target_time)
+            logger.info("  BOOKED: %s — %s", r.target_date, r.session_name)
         for r in failures:
-            logger.info("  FAILED: %s @ %s — %s", r.target_date, r.target_time, r.message)
+            logger.info("  FAILED: %s — %s: %s", r.target_date, r.session_name, r.message)
         notify_summary(len(successes), len(failures))
 
     logger.info("=== Run complete ===")

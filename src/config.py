@@ -23,7 +23,8 @@ class Config:
     club_name: str
     sport: str
     preferred_days: List[str]
-    preferred_times: List[str]
+    session_keywords: List[str]
+    session_exclusions: List[str]
     booking_horizon_days: int
     headless: bool
     log_file: str
@@ -57,7 +58,8 @@ def load_config(env_path: Path | None = None, config_path: Path | None = None) -
     club_name = raw.get("club_name", "").strip()
     sport = raw.get("sport", "pickleball").strip()
     preferred_days = [d.lower() for d in raw.get("preferred_days", [])]
-    preferred_times = raw.get("preferred_times", [])
+    session_keywords = [k.lower() for k in raw.get("session_keywords", [])]
+    session_exclusions = [e.lower() for e in raw.get("session_exclusions", [])]
     booking_horizon_days = int(raw.get("booking_horizon_days", 7))
     headless = bool(raw.get("headless", True))
     log_file = raw.get("log_file", "logs/booking.log")
@@ -66,8 +68,8 @@ def load_config(env_path: Path | None = None, config_path: Path | None = None) -
         raise ValueError("club_name must be set in config.yaml")
     if not preferred_days:
         raise ValueError("preferred_days must not be empty in config.yaml")
-    if not preferred_times:
-        raise ValueError("preferred_times must not be empty in config.yaml")
+    if not session_keywords:
+        raise ValueError("session_keywords must not be empty in config.yaml")
 
     valid_days = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
     for day in preferred_days:
@@ -80,7 +82,8 @@ def load_config(env_path: Path | None = None, config_path: Path | None = None) -
         club_name=club_name,
         sport=sport,
         preferred_days=preferred_days,
-        preferred_times=preferred_times,
+        session_keywords=session_keywords,
+        session_exclusions=session_exclusions,
         booking_horizon_days=booking_horizon_days,
         headless=headless,
         log_file=log_file,

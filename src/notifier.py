@@ -10,9 +10,14 @@ logger = logging.getLogger(__name__)
 APP_TITLE = "Lifetime Pickleball Booker"
 
 
+def _sanitize(s: str) -> str:
+    """Escape backslashes and double-quotes for AppleScript string literals."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _notify(message: str, title: str, subtitle: str = "") -> None:
-    subtitle_part = f' subtitle "{subtitle}"' if subtitle else ""
-    script = f'display notification "{message}" with title "{title}"{subtitle_part}'
+    subtitle_part = f' subtitle "{_sanitize(subtitle)}"' if subtitle else ""
+    script = f'display notification "{_sanitize(message)}" with title "{_sanitize(title)}"{subtitle_part}'
     try:
         subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
     except subprocess.CalledProcessError as e:

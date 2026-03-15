@@ -1,24 +1,19 @@
-"""Discover available pickleball slots and book them."""
+"""Discover available pickleball sessions and book them by keyword."""
 
 from __future__ import annotations
 
 import logging
-import random
-import time
+import re
+import time as _time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
-from playwright.sync_api import Page
+from playwright.sync_api import Locator, Page
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
-
-# Lifetime's court booking lives under this base URL.
-# NOTE: The exact path/query params must be confirmed by inspecting the live site
-# while logged in.  Navigate to the court booking page and copy the URL here.
-BOOKING_BASE_URL = "https://my.lifetime.life/classes/court-reservations.html"
 
 DAY_NAMES = {
     "monday": 0,
@@ -30,18 +25,89 @@ DAY_NAMES = {
     "sunday": 6,
 }
 
+# Time pattern: "7:00 to 8:30 AM" or "10:00 AM to 12:00 PM"
+_TIME_RE = re.compile(
+    r"(\d{1,2}:\d{2})\s*(?:(AM|PM)\s+)?to\s+\d{1,2}:\d{2}\s*(AM|PM)",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class BookingResult:
     target_date: date
-    target_time: str
+    session_name: str
     success: bool
     message: str
     dry_run: bool = False
 
 
-def _random_delay(lo: float = 0.5, hi: float = 1.5) -> None:
-    time.sleep(random.uniform(lo, hi))
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _club_url_slug(club_name: str) -> str:
+    """Convert 'PENN 1' -> 'penn-1' for use in Lifetime URLs."""
+    return club_name.lower().replace(" ", "-")
+
+
+def _classes_url(cfg: Config, target_date: date) -> str:
+    slug = _club_url_slug(cfg.club_name)
+    date_str = target_date.strftime("%Y-%m-%d")
+    return (
+        f"https://my.lifetime.life/clubs/ny/{slug}/classes.html"
+        f"?teamMemberView=true&mode=week&selectedDate={date_str}&interest=Pickleball"
+    )
+
+
+def _reservations_url() -> str:
+    return "https://my.lifetime.life/account/my-reservations.html"
+
+
+def _session_matches(session_text: str, cfg: Config) -> bool:
+    """Return True if session_text matches a keyword and is not excluded."""
+    text = session_text.lower()
+    for excl in cfg.session_exclusions:
+        if excl in text:
+            return False
+    for kw in cfg.session_keywords:
+        if kw in text:
+            return True
+    return False
+
+
+def _parse_session_start(session_text: str, target_date: date) -> Optional[datetime]:
+    """
+    Parse the session start time from text like '7:00 to 8:30 AM' or '10:00 AM to 12:00 PM'.
+    Returns a datetime combining target_date + start time, or None if unparseable.
+    """
+    m = _TIME_RE.search(session_text)
+    if not m:
+        return None
+
+    time_str = m.group(1)        # e.g. "7:00" or "10:00"
+    start_ampm = m.group(2)      # e.g. "AM" if written as "10:00 AM to ..."
+    end_ampm = m.group(3)        # e.g. "AM" or "PM" at the end
+
+    # If start has its own AM/PM, use it; otherwise infer from end AM/PM
+    ampm = (start_ampm or end_ampm or "AM").upper()
+
+    try:
+        dt = datetime.strptime(f"{target_date} {time_str} {ampm}", "%Y-%m-%d %I:%M %p")
+        return dt
+    except ValueError:
+        return None
+
+
+def _is_future_session(session_text: str, target_date: date) -> bool:
+    """
+    Fix 1: Return True only if the session hasn't started yet.
+    If the start time can't be parsed, assume future (don't block it).
+    """
+    start_dt = _parse_session_start(session_text, target_date)
+    if start_dt is None:
+        logger.debug("Could not parse start time from: %s", session_text[:60])
+        return True  # give benefit of the doubt
+    return start_dt > datetime.now()
 
 
 def _target_dates(cfg: Config) -> List[date]:
@@ -56,158 +122,183 @@ def _target_dates(cfg: Config) -> List[date]:
     return dates
 
 
-def _navigate_to_booking_page(page: Page, cfg: Config) -> bool:
-    """
-    Navigate to the court reservation page for the configured sport/club.
+# ---------------------------------------------------------------------------
+# Fix 2: Fetch existing reservations
+# ---------------------------------------------------------------------------
 
-    TODO: Once you've identified the exact URL structure for your club,
-    update BOOKING_BASE_URL above and refine the selectors below.
+def _fetch_existing_reservations(page: Page) -> Set[str]:
     """
-    logger.info("Navigating to court booking page...")
+    Navigate to the My Reservations page and return a set of session name
+    substrings that are already booked, for duplicate detection.
+
+    The set contains lowercased session title tokens so we can do a substring
+    match against session cards we find on the schedule page.
+    """
+    reserved: Set[str] = set()
     try:
-        page.goto(BOOKING_BASE_URL, wait_until="networkidle", timeout=20000)
-        _random_delay()
+        page.goto(_reservations_url(), wait_until="networkidle", timeout=20000)
+        _time.sleep(1)
+
+        # Grab all reservation entries — selector TBD after inspecting the page
+        entries = page.locator(
+            '[data-testid*="reservation"], [class*="reservation-item"], '
+            '[class*="my-reservation"], [class*="upcoming-reservation"]'
+        ).all()
+
+        for el in entries:
+            try:
+                text = el.inner_text().strip().lower()
+                if text:
+                    reserved.add(text)
+            except Exception:
+                continue
+
+        # Fallback: grab any text that looks like a session title
+        if not reserved:
+            cards = page.locator('[class*="card"], [class*="item"]').all()
+            for el in cards:
+                try:
+                    text = el.inner_text().strip().lower()
+                    if "pickleball" in text and len(text) < 300:
+                        reserved.add(text)
+                except Exception:
+                    continue
+
+        logger.info("Found %d existing reservation(s).", len(reserved))
+    except Exception as e:
+        logger.warning("Could not fetch existing reservations: %s", e)
+
+    return reserved
+
+
+def _already_reserved(session_name: str, existing: Set[str]) -> bool:
+    """
+    Fix 2: Return True if session_name appears to be in the existing reservations set.
+    Uses substring matching since the reservation page may show slightly different text.
+    """
+    name_lower = session_name.lower()
+    # Check if any word chunk (>8 chars) of session_name appears in an existing entry
+    for existing_text in existing:
+        if name_lower in existing_text or existing_text in name_lower:
+            return True
+        # Partial match on the distinctive part of the title (after the colon)
+        if ":" in name_lower:
+            distinctive = name_lower.split(":", 1)[1].strip()
+            if len(distinctive) > 6 and distinctive in existing_text:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Page navigation + session discovery
+# ---------------------------------------------------------------------------
+
+def _navigate_to_date(page: Page, cfg: Config, target_date: date) -> bool:
+    url = _classes_url(cfg, target_date)
+    logger.info("Loading schedule for %s: %s", target_date, url)
+    try:
+        page.goto(url, wait_until="networkidle", timeout=20000)
+        _time.sleep(1)
         return True
     except Exception as e:
-        logger.error("Could not reach booking page: %s", e)
+        logger.error("Could not load schedule page: %s", e)
         return False
 
 
-def _select_club(page: Page, club_name: str) -> bool:
+def _select_day(page: Page, target_date: date) -> bool:
     """
-    Select the target club from a dropdown or filter if the page shows multiple clubs.
-
-    IMPORTANT: Selectors here are placeholders — inspect the live page and update.
-    """
-    try:
-        # Try a club/location filter dropdown
-        club_selector = '[data-testid="club-filter"], select[name*="club"], select[id*="club"], select[id*="location"]'
-        if page.locator(club_selector).count() > 0:
-            page.select_option(club_selector, label=club_name)
-            _random_delay()
-            logger.debug("Selected club: %s", club_name)
-        else:
-            # Some pages show club tabs or buttons
-            club_btn = page.locator(f'button:has-text("{club_name}"), [data-club*="{club_name}"]').first
-            if club_btn.is_visible():
-                club_btn.click()
-                _random_delay()
-                logger.debug("Clicked club button: %s", club_name)
-        return True
-    except Exception as e:
-        logger.warning("Could not select club '%s': %s", club_name, e)
-        return False
-
-
-def _select_date(page: Page, target_date: date) -> bool:
-    """
-    Navigate the calendar/date picker to the target date.
-
-    IMPORTANT: Selectors here are placeholders — inspect the live page and update.
+    Click the day radio for target_date to filter the week view to that day.
+    The radio inputs are visually hidden, so we use JS to click them.
     """
     date_str = target_date.strftime("%Y-%m-%d")
-    label_str = target_date.strftime("%-m/%-d/%Y")  # e.g. 3/15/2026
     try:
-        # Look for a date input or calendar day cell
-        date_input = page.locator('input[type="date"]').first
-        if date_input.is_visible():
-            date_input.fill(date_str)
-            _random_delay()
+        clicked = page.evaluate(f"""() => {{
+            const radio = document.querySelector('.planner-date-radio-input[value="{date_str}"]');
+            if (!radio) return false;
+            radio.click();
+            return true;
+        }}""")
+        if clicked:
+            _time.sleep(0.5)
             return True
-
-        # Try clicking a calendar cell by aria-label or data-date
-        day_cell = page.locator(
-            f'[data-date="{date_str}"], [aria-label*="{label_str}"], td:has-text("{target_date.day}")'
-        ).first
-        if day_cell.is_visible():
-            day_cell.click()
-            _random_delay()
-            return True
-
-        logger.warning("Could not find date picker element for %s", date_str)
+        logger.warning("Day radio not found for %s", date_str)
         return False
     except Exception as e:
-        logger.warning("Could not select date %s: %s", date_str, e)
+        logger.warning("Could not click day radio for %s: %s", date_str, e)
         return False
 
 
-def _find_slot(page: Page, target_time: str, cfg: Config) -> Optional[object]:
+def _find_matching_sessions(
+    page: Page,
+    cfg: Config,
+    target_date: date,
+    existing_reservations: Set[str],
+) -> List[Tuple[str, Locator]]:
     """
-    Scan the page for an available slot at target_time for the configured sport.
-
-    Returns the Playwright Locator for the booking button if found, else None.
-
-    IMPORTANT: The selectors below are placeholders.  You need to:
-    1. Log in manually and navigate to the booking page.
-    2. Open DevTools → Inspector, find the time slot rows and the "Book" button.
-    3. Replace the selectors below with what you find.
+    Return (session_name, reserve_button) for every session on the page that:
+      - matches a keyword (with exclusions)
+      - has a "Reserve" CTA (not Waitlist / Cancel / already-reserved)
+      - hasn't already started (Fix 1)
+      - isn't already in existing_reservations (Fix 2)
     """
-    # Normalize time for display matching: "07:00" → "7:00 AM"
-    hour, minute = map(int, target_time.split(":"))
-    am_pm = "AM" if hour < 12 else "PM"
-    display_hour = hour if hour <= 12 else hour - 12
-    display_hour = 12 if display_hour == 0 else display_hour
-    time_display_variants = [
-        f"{display_hour}:{minute:02d} {am_pm}",
-        f"{display_hour}:{minute:02d}{am_pm}",
-        target_time,
-    ]
-
-    sport = cfg.sport.lower()
+    matches: List[Tuple[str, Locator]] = []
 
     try:
-        # Look for rows/cards that mention the sport and the time
-        for time_str in time_display_variants:
-            # Slot container: adjust selector after inspecting the real page
-            slot = page.locator(
-                f'[class*="slot"]:has-text("{time_str}"), '
-                f'[class*="reservation"]:has-text("{time_str}"), '
-                f'tr:has-text("{time_str}")'
-            ).first
+        entries = page.locator('[data-testid="classCell"]').all()
+        logger.debug("Found %d session entries on page", len(entries))
 
-            if not slot.is_visible(timeout=2000):
+        for entry in entries:
+            try:
+                session_text = entry.inner_text().strip()
+                session_lower = session_text.lower()
+
+                # Keyword match
+                if not _session_matches(session_lower, cfg):
+                    continue
+
+                # Fix 1: skip sessions that have already started
+                if not _is_future_session(session_text, target_date):
+                    logger.debug("Skipping past session: %s", session_text[:60])
+                    continue
+
+                # Only book if the CTA says exactly "Reserve" — not Waitlist, Cancel, etc.
+                cta = entry.locator(".card-cta").first
+                if not cta.is_visible():
+                    continue
+                cta_text = cta.inner_text().strip()
+                if cta_text.lower() != "reserve":
+                    logger.debug("Skipping (CTA=%r): %s", cta_text, session_text[:60])
+                    continue
+
+                # Fix 2: skip if already reserved
+                session_name = session_text.split("\n")[0].strip()
+                if _already_reserved(session_name, existing_reservations):
+                    logger.info("Already reserved, skipping: %s", session_name)
+                    continue
+
+                logger.info("Found bookable session: %s", session_name)
+                matches.append((session_name, cta))
+
+            except Exception:
                 continue
-
-            # Check it's for the right sport
-            slot_text = slot.inner_text().lower()
-            if sport not in slot_text and "court" not in slot_text:
-                continue
-
-            # Look for a bookable/available button within this slot
-            book_btn = slot.locator(
-                'button:has-text("Book"), button:has-text("Reserve"), '
-                'a:has-text("Book"), [class*="book-btn"]'
-            ).first
-
-            if book_btn.is_visible():
-                logger.info("Found available slot at %s", time_str)
-                return book_btn
-
-        logger.debug("No available slot found at %s", target_time)
-        return None
 
     except Exception as e:
-        logger.debug("Error searching for slot at %s: %s", target_time, e)
-        return None
+        logger.debug("Error scanning sessions: %s", e)
+
+    return matches
 
 
 def _confirm_booking(page: Page) -> bool:
-    """
-    Click through any confirmation dialog that appears after pressing Book.
-
-    IMPORTANT: Update selectors after inspecting the live confirmation modal.
-    """
+    """Click through the confirmation modal after pressing Reserve."""
     try:
         confirm_btn = page.locator(
             'button:has-text("Confirm"), button:has-text("Complete"), '
             'button:has-text("Yes"), [class*="confirm"]'
         ).first
         confirm_btn.wait_for(state="visible", timeout=8000)
-        _random_delay(0.3, 0.7)
         confirm_btn.click()
-        _random_delay(1.0, 2.0)
+        _time.sleep(1)
 
-        # Check for a success indicator
         success = page.locator(
             '[class*="success"], [class*="confirmation"], '
             ':has-text("confirmed"), :has-text("booked")'
@@ -215,16 +306,24 @@ def _confirm_booking(page: Page) -> bool:
         if success.is_visible(timeout=5000):
             return True
 
-        logger.warning("No success indicator found after confirmation click.")
+        logger.warning("No success indicator found after confirmation.")
         return False
     except Exception as e:
         logger.warning("Confirmation step failed: %s", e)
         return False
 
 
+# ---------------------------------------------------------------------------
+# Main booking loop
+# ---------------------------------------------------------------------------
+
 def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingResult]:
     """
-    Main booking loop: iterate target dates × preferred times, book each available slot.
+    For each target date within the horizon:
+      - load the schedule page
+      - select that specific day
+      - find all sessions matching keywords that are future + not already reserved
+      - book them all (or report in dry-run mode)
     """
     results: List[BookingResult] = []
     targets = _target_dates(cfg)
@@ -233,70 +332,53 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
         logger.info("No target dates found within the booking horizon.")
         return results
 
-    if not _navigate_to_booking_page(page, cfg):
-        return results
+    # Fix 2: fetch existing reservations once up front
+    existing_reservations = _fetch_existing_reservations(page)
 
     for target_date in targets:
         logger.info("Checking %s (%s)...", target_date, target_date.strftime("%A"))
 
-        # Re-navigate for each date to get a fresh view
-        if not _navigate_to_booking_page(page, cfg):
-            continue
-        _select_club(page, cfg.club_name)
-        if not _select_date(page, target_date):
-            logger.warning("Skipping %s — could not set date.", target_date)
+        if not _navigate_to_date(page, cfg, target_date):
             continue
 
-        _random_delay()
+        if not _select_day(page, target_date):
+            logger.warning("Could not filter to day %s, proceeding anyway.", target_date)
 
-        for target_time in cfg.preferred_times:
-            book_btn = _find_slot(page, target_time, cfg)
+        sessions = _find_matching_sessions(page, cfg, target_date, existing_reservations)
 
-            if book_btn is None:
-                result = BookingResult(
-                    target_date=target_date,
-                    target_time=target_time,
-                    success=False,
-                    message="No available slot found.",
-                    dry_run=dry_run,
-                )
-                results.append(result)
-                logger.info("  %s @ %s — not available", target_date, target_time)
-                continue
+        if not sessions:
+            logger.info("  %s — no bookable sessions found.", target_date)
+            continue
 
+        for session_name, reserve_btn in sessions:
             if dry_run:
-                result = BookingResult(
+                results.append(BookingResult(
                     target_date=target_date,
-                    target_time=target_time,
+                    session_name=session_name,
                     success=True,
-                    message="[DRY RUN] Slot found but not booked.",
+                    message="[DRY RUN] Session found but not booked.",
                     dry_run=True,
-                )
-                results.append(result)
-                logger.info("  %s @ %s — [DRY RUN] available", target_date, target_time)
+                ))
+                logger.info("  [DRY RUN] %s — available: %s", target_date, session_name)
                 continue
 
-            # Attempt to book
-            logger.info("  Booking %s @ %s...", target_date, target_time)
-            _random_delay(0.5, 1.0)
-            book_btn.click()
-            _random_delay()
+            logger.info("  Booking %s — %s...", target_date, session_name)
+            reserve_btn.click()
+            _time.sleep(0.8)
 
             booked = _confirm_booking(page)
-            result = BookingResult(
+            results.append(BookingResult(
                 target_date=target_date,
-                target_time=target_time,
+                session_name=session_name,
                 success=booked,
-                message="Booking confirmed." if booked else "Booking failed after confirmation step.",
-                dry_run=False,
-            )
-            results.append(result)
+                message="Booking confirmed." if booked else "Booking failed after confirmation.",
+            ))
 
             if booked:
-                logger.info("  SUCCESS: %s @ %s booked.", target_date, target_time)
+                logger.info("  SUCCESS: %s — %s", target_date, session_name)
+                # Add to known reservations so we don't double-book within this run
+                existing_reservations.add(session_name.lower())
             else:
-                logger.warning("  FAILED: %s @ %s booking failed.", target_date, target_time)
-
-            _random_delay(1.0, 2.0)
+                logger.warning("  FAILED: %s — %s", target_date, session_name)
 
     return results

@@ -27,19 +27,19 @@ def _do_login(page: Page, email: str, password: str) -> bool:
     page.goto(LOGIN_URL, wait_until="networkidle")
     _random_delay()
 
-    # Fill email
-    email_selector = 'input[type="email"], input[name="email"], input[id*="email"]'
+    # Fill username/email — Lifetime uses name="username" / id="account-username"
+    email_selector = '#account-username'
     page.wait_for_selector(email_selector, timeout=15000)
     page.fill(email_selector, email)
     _random_delay(0.3, 0.7)
 
     # Fill password
-    password_selector = 'input[type="password"], input[name="password"], input[id*="password"]'
+    password_selector = '#account-password'
     page.fill(password_selector, password)
     _random_delay(0.3, 0.8)
 
     # Submit
-    submit_selector = 'button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")'
+    submit_selector = 'button[type="submit"]'
     page.click(submit_selector)
 
     # Wait for navigation or error
