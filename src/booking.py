@@ -354,88 +354,90 @@ def _get_registration_open_time(page: Page) -> Optional[datetime]:
 # Class detail page booking
 # ---------------------------------------------------------------------------
 
-def _book_on_details_page(page: Page, details_url: str, poll_timeout_seconds: int = 300) -> bool:
+def _try_click_reserve(page: Page) -> bool:
     """
-    Navigate to the class detail page early and wait on-page for the Reserve
-    button to become clickable — no reloading while waiting. Playwright's
-    wait_for_function polls the live DOM via MutationObserver, so we react
-    within milliseconds of the button appearing.
+    Select Tim and click the Reserve button if it's currently available.
+    Returns True if booking confirmed, False otherwise.
+    """
+    _select_participant(page)
+    for btn in page.locator('[data-testid="reserveButton"]').all():
+        try:
+            if (
+                btn.is_visible()
+                and btn.is_enabled()
+                and btn.inner_text().strip().lower() == "reserve"
+            ):
+                logger.info("    Reserve button available — clicking now.")
+                btn.click()
+                try:
+                    page.wait_for_url(
+                        lambda url: "/account/reservations" in url, timeout=10000
+                    )
+                    return True
+                except Exception:
+                    if "/account/reservations" in page.url:
+                        return True
+                    logger.warning("    Unexpected URL after booking: %s", page.url)
+                    return False
+        except Exception:
+            continue
+    return False
 
-    If the booking window opens at a known future time we log it and wait;
-    if it's already open we click immediately.
+
+def _book_on_details_page(
+    page: Page,
+    details_url: str,
+    open_time: Optional[datetime] = None,
+    poll_timeout_seconds: int = 300,
+) -> bool:
+    """
+    Booking strategy:
+    1. Navigate to the class detail page (caller already slept until 60s before open).
+    2. At the exact millisecond registration opens, attempt to click Reserve.
+    3. If the button isn't there yet, reload every 500ms until it appears, then click.
+
+    open_time: the exact datetime registration opens (session_start - 7d22h).
     """
     try:
         page.goto(details_url, wait_until="networkidle", timeout=20000)
         dismiss_cookie_popup(page)
-
-        # Pre-select Tim early in case checkboxes are already enabled
         _select_participant(page)
 
-        deadline_mono = _time.monotonic() + poll_timeout_seconds
+        # If registration is already open, try immediately
+        if _try_click_reserve(page):
+            return True
 
-        # Check for a "Registration will be open on X at Y" banner
-        open_time = _get_registration_open_time(page)
+        # Sleep on-page until the exact open time, then strike
         if open_time is not None:
             wait_secs = (open_time - datetime.now()).total_seconds()
             if wait_secs > poll_timeout_seconds:
                 logger.info(
-                    "    Registration opens in %.0fs — beyond timeout, skipping.", wait_secs
+                    "    Registration opens in %.0fs — beyond poll timeout, skipping.",
+                    wait_secs,
                 )
                 return False
             if wait_secs > 0:
                 logger.info(
-                    "    Registration opens at %s — watching page for Reserve button "
-                    "(%.1fs away)...",
+                    "    Waiting on page until registration opens at %s (%.1fs)...",
                     open_time.strftime("%I:%M:%S %p"),
                     wait_secs,
                 )
+                _time.sleep(wait_secs)
+                logger.info("    Open time reached — attempting Reserve now.")
 
-        # Stay on the page and watch the live DOM — no reloads.
-        # wait_for_function resolves the instant the JS expression returns true,
-        # giving us sub-100ms reaction time from when the button becomes available.
-        remaining_ms = int((deadline_mono - _time.monotonic()) * 1000)
-        logger.info("    Watching for Reserve button (up to %ds)...", poll_timeout_seconds)
-
-        button_appeared = False
-        try:
-            page.wait_for_function(_RESERVE_READY_JS, timeout=remaining_ms)
-            button_appeared = True
-        except Exception:
-            # wait_for_function timed out — do one reload as last-chance fallback
-            logger.debug("    wait_for_function timed out; trying one reload.")
-            page.reload(wait_until="networkidle", timeout=15000)
+        # At open time: try immediately, then reload every 500ms
+        deadline_mono = _time.monotonic() + poll_timeout_seconds
+        attempt = 0
+        while _time.monotonic() < deadline_mono:
+            attempt += 1
+            page.reload(wait_until="domcontentloaded", timeout=10000)
             dismiss_cookie_popup(page)
+            logger.debug("    Reload #%d — checking for Reserve button.", attempt)
+            if _try_click_reserve(page):
+                return True
+            _time.sleep(0.5)
 
-        # Select Tim (may have reset after reload or on registration open)
-        _select_participant(page)
-
-        # Find and click the Reserve button
-        for btn in page.locator('[data-testid="reserveButton"]').all():
-            try:
-                if (
-                    btn.is_visible()
-                    and btn.is_enabled()
-                    and btn.inner_text().strip().lower() == "reserve"
-                ):
-                    logger.info("    Reserve button available — clicking now.")
-                    btn.click()
-                    try:
-                        page.wait_for_url(
-                            lambda url: "/account/reservations" in url, timeout=10000
-                        )
-                        return True
-                    except Exception:
-                        if "/account/reservations" in page.url:
-                            return True
-                        logger.warning("    Unexpected URL after booking: %s", page.url)
-                        return False
-            except Exception:
-                continue
-
-        if not button_appeared:
-            logger.warning("    Reserve button never became available within %ds.", poll_timeout_seconds)
-        else:
-            logger.warning("    Reserve button was detected but could not be clicked.")
+        logger.warning("    Reserve button never appeared within %ds.", poll_timeout_seconds)
         return False
 
     except Exception as e:
@@ -535,7 +537,9 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
     # ------------------------------------------------------------------
     for target_date, session_name, details_url, session_text in all_sessions:
         logger.info("  Booking %s — %s...", target_date, session_name)
-        booked = _book_on_details_page(page, details_url)
+        start_dt = _parse_session_start(session_text, target_date)
+        open_time = (start_dt - timedelta(days=7, hours=22)) if start_dt else None
+        booked = _book_on_details_page(page, details_url, open_time=open_time)
         results.append(BookingResult(
             target_date=target_date,
             session_name=session_name,
@@ -546,7 +550,6 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
         if booked:
             logger.info("  SUCCESS: %s — %s", target_date, session_name)
             existing_reservations.add(session_name.lower())
-            start_dt = _parse_session_start(session_text, target_date)
             end_dt = _parse_session_end(session_text, target_date)
             add_to_calendar(session_name, start_dt, end_dt, timezone=cfg.calendar_timezone)
         else:
