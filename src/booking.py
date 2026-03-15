@@ -34,14 +34,15 @@ _REG_OPENS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# JavaScript that resolves True the moment the Reserve button is clickable
+# JavaScript that resolves True the moment Reserve or Add to Waitlist is clickable
 _RESERVE_READY_JS = """() => {
     const btns = [...document.querySelectorAll('[data-testid="reserveButton"]')];
-    return btns.some(btn =>
-        btn.offsetParent !== null &&
-        !btn.disabled &&
-        btn.innerText.trim().toLowerCase() === 'reserve'
-    );
+    return btns.some(btn => {
+        const text = btn.innerText.trim().toLowerCase();
+        return btn.offsetParent !== null &&
+               !btn.disabled &&
+               (text === 'reserve' || text.includes('waitlist'));
+    });
 }"""
 
 
@@ -118,13 +119,15 @@ def _parse_session_end(session_text: str, target_date: date) -> Optional[datetim
 
 def _is_in_booking_window(session_text: str, target_date: date) -> bool:
     """
-    Return True if the session's booking window is now open (or will open soon).
-    Booking opens at session_start - 7 days - 22 hours.
+    Return True if the session's booking window opened within the last 30 minutes,
+    or opens in the future. This targets sessions at the leading edge of the
+    booking window and excludes older sessions already open for days.
     """
     start_dt = _parse_session_start(session_text, target_date)
     if start_dt is None:
         return True  # can't determine — let the detail page decide
-    return start_dt >= datetime.now() + timedelta(days=7, hours=22)
+    booking_open_time = start_dt - timedelta(days=7, hours=22)
+    return booking_open_time >= datetime.now() - timedelta(hours=24)
 
 
 def _is_allowed_time(session_text: str, target_date: date) -> bool:
@@ -376,28 +379,56 @@ def _try_click_reserve(page: Page) -> bool:
     """
     _wait_for_spinner(page)
     _select_participant(page)
+    # Prefer Reserve over Waitlist — collect all buttons and sort by priority
+    reserve_btn = None
+    waitlist_btn = None
     for btn in page.locator('[data-testid="reserveButton"]').all():
         try:
-            if (
-                btn.is_visible()
-                and btn.is_enabled()
-                and btn.inner_text().strip().lower() == "reserve"
-            ):
-                logger.info("    Reserve button available — clicking now.")
-                btn.click()
+            text = btn.inner_text().strip().lower()
+            if text == "reserve" and reserve_btn is None:
+                reserve_btn = btn
+            elif "waitlist" in text and waitlist_btn is None:
+                waitlist_btn = btn
+        except Exception:
+            continue
+
+    target = reserve_btn or waitlist_btn
+    if target is None:
+        return False
+
+    try:
+        text = target.inner_text().strip()
+        logger.info("    Clicking button: '%s'", text)
+        target.evaluate("el => el.click()")
+
+        # Wait for either the Pending Reservation page or final reservations page
+        try:
+            page.wait_for_url(
+                lambda url: "pending" in url.lower() or "/account/reservations" in url,
+                timeout=10000,
+            )
+        except Exception:
+            pass
+
+        # If we landed on a Pending Reservation page, click Finish
+        if "pending" in page.url.lower() or page.locator(':text("Pending")').first.is_visible(timeout=2000):
+            logger.info("    Pending Reservation page detected — clicking Finish.")
+            finish_btn = page.locator('button:has-text("Finish"), a:has-text("Finish")').first
+            if finish_btn.is_visible(timeout=5000):
+                finish_btn.evaluate("el => el.click()")
                 try:
                     page.wait_for_url(
                         lambda url: "/account/reservations" in url, timeout=10000
                     )
-                    return True
                 except Exception:
-                    if "/account/reservations" in page.url:
-                        return True
-                    logger.warning("    Unexpected URL after booking: %s", page.url)
-                    return False
-        except Exception:
-            continue
-    return False
+                    pass
+
+        if "/account/reservations" in page.url:
+            return True
+        logger.warning("    Unexpected URL after booking: %s", page.url)
+        return False
+    except Exception:
+        return False
 
 
 def _book_on_details_page(
@@ -441,7 +472,17 @@ def _book_on_details_page(
                 _time.sleep(wait_secs)
                 logger.info("    Open time reached — attempting Reserve now.")
 
-        # At open time: try immediately, then reload every 500ms
+        # At open time: first watch the current page reactively (Vue may update
+        # the button without a reload). wait_for_function fires within milliseconds.
+        logger.info("    Watching current page for Reserve button (reactive, up to 5s)...")
+        try:
+            page.wait_for_function(_RESERVE_READY_JS, timeout=5000)
+            if _try_click_reserve(page):
+                return True
+        except Exception:
+            pass  # button didn't appear reactively — fall through to reload loop
+
+        # Fallback: reload every 500ms until Reserve appears
         deadline_mono = _time.monotonic() + poll_timeout_seconds
         attempt = 0
         while _time.monotonic() < deadline_mono:
