@@ -79,9 +79,11 @@ def get_authenticated_context(cfg: Config, playwright_instance=None) -> tuple:
         context: BrowserContext = browser.new_context(storage_state=str(storage_path))
         page: Page = context.new_page()
 
-        # Quick check — try to reach a protected page
+        # Validate session against a protected page — the homepage is publicly
+        # accessible and would pass even with expired cookies.
         try:
-            page.goto("https://my.lifetime.life/", wait_until="networkidle", timeout=15000)
+            page.goto("https://my.lifetime.life/account/my-reservations.html",
+                      wait_until="networkidle", timeout=15000)
             dismiss_cookie_popup(page)
             if "login" not in page.url.lower():
                 logger.info("Existing session is valid.")
