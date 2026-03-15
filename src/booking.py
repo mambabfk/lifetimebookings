@@ -12,6 +12,7 @@ from typing import List, Optional, Set, Tuple
 from playwright.sync_api import Locator, Page
 
 from .config import Config
+from .notifier import add_to_calendar
 from .utils import dismiss_cookie_popup
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ DAY_NAMES = {
 
 # Time pattern: "7:00 to 8:30 AM" or "10:00 AM to 12:00 PM"
 _TIME_RE = re.compile(
-    r"(\d{1,2}:\d{2})\s*(?:(AM|PM)\s+)?to\s+\d{1,2}:\d{2}\s*(AM|PM)",
+    r"(\d{1,2}:\d{2})\s*(?:(AM|PM)\s+)?to\s+(\d{1,2}:\d{2})\s*(AM|PM)",
     re.IGNORECASE,
 )
 
@@ -87,13 +88,32 @@ def _parse_session_start(session_text: str, target_date: date) -> Optional[datet
 
     time_str = m.group(1)        # e.g. "7:00" or "10:00"
     start_ampm = m.group(2)      # e.g. "AM" if written as "10:00 AM to ..."
-    end_ampm = m.group(3)        # e.g. "AM" or "PM" at the end
+    end_ampm = m.group(4)        # e.g. "AM" or "PM" at the end
 
     # If start has its own AM/PM, use it; otherwise infer from end AM/PM
     ampm = (start_ampm or end_ampm or "AM").upper()
 
     try:
         dt = datetime.strptime(f"{target_date} {time_str} {ampm}", "%Y-%m-%d %I:%M %p")
+        return dt
+    except ValueError:
+        return None
+
+
+def _parse_session_end(session_text: str, target_date: date) -> Optional[datetime]:
+    """
+    Parse the session end time from text like '7:00 to 8:30 AM' or '10:00 AM to 12:00 PM'.
+    Returns a datetime combining target_date + end time, or None if unparseable.
+    """
+    m = _TIME_RE.search(session_text)
+    if not m:
+        return None
+
+    end_time_str = m.group(3)    # e.g. "8:30" or "12:00"
+    end_ampm = m.group(4)        # e.g. "AM" or "PM"
+
+    try:
+        dt = datetime.strptime(f"{target_date} {end_time_str} {end_ampm.upper()}", "%Y-%m-%d %I:%M %p")
         return dt
     except ValueError:
         return None
@@ -242,16 +262,16 @@ def _find_matching_sessions(
     cfg: Config,
     target_date: date,
     existing_reservations: Set[str],
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, str]]:
     """
-    Return (session_name, details_url) for every session on the page that:
+    Return (session_name, details_url, session_text) for every session on the page that:
       - belongs to the target_date day column
       - matches a keyword (with exclusions)
       - has a "Reserve" CTA link (not Waitlist / Cancel)
       - hasn't already started (Fix 1)
       - isn't already in existing_reservations (Fix 2)
     """
-    matches: List[Tuple[str, str]] = []
+    matches: List[Tuple[str, str, str]] = []
 
     # Scope to the correct day column so we never pick up sessions from other days
     day_idx = _day_column_index(page, target_date)
@@ -307,7 +327,7 @@ def _find_matching_sessions(
                 continue
 
             logger.info("Found bookable session: %s", session_name)
-            matches.append((session_name, details_url))
+            matches.append((session_name, details_url, session_text))
 
         except Exception:
             continue
@@ -402,7 +422,7 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
             logger.info("  %s — no bookable sessions found.", target_date)
             continue
 
-        for session_name, details_url in sessions:
+        for session_name, details_url, session_text in sessions:
             if dry_run:
                 results.append(BookingResult(
                     target_date=target_date,
@@ -427,6 +447,10 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
                 logger.info("  SUCCESS: %s — %s", target_date, session_name)
                 # Add to known reservations so we don't double-book within this run
                 existing_reservations.add(session_name.lower())
+                # Add to Google Calendar
+                start_dt = _parse_session_start(session_text, target_date)
+                end_dt = _parse_session_end(session_text, target_date)
+                add_to_calendar(session_name, start_dt, end_dt, timezone=cfg.calendar_timezone)
             else:
                 logger.warning("  FAILED: %s — %s", target_date, session_name)
 

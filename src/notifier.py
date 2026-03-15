@@ -1,9 +1,22 @@
-"""macOS desktop notifications via osascript."""
+"""macOS desktop notifications and Google Calendar events."""
 
 from __future__ import annotations
 
 import logging
 import subprocess
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+_ROOT = Path(__file__).parent.parent
+_CREDENTIALS_PATH = _ROOT / "credentials.json"
+_TOKEN_PATH = _ROOT / "token.json"
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +47,59 @@ def notify_success(message: str) -> None:
 def notify_failure(message: str) -> None:
     """Send a failure desktop notification."""
     _notify(message, title=APP_TITLE, subtitle="Booking Failed")
+
+
+def _get_calendar_service():
+    """Return an authenticated Google Calendar API service, running OAuth flow if needed."""
+    creds: Optional[Credentials] = None
+    if _TOKEN_PATH.exists():
+        creds = Credentials.from_authorized_user_file(str(_TOKEN_PATH), _SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not _CREDENTIALS_PATH.exists():
+                raise FileNotFoundError(
+                    f"Google Calendar credentials not found at {_CREDENTIALS_PATH}.\n"
+                    "Download OAuth 2.0 credentials from Google Cloud Console and save as credentials.json."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(str(_CREDENTIALS_PATH), _SCOPES)
+            creds = flow.run_local_server(port=0)
+        _TOKEN_PATH.write_text(creds.to_json())
+    return build("calendar", "v3", credentials=creds)
+
+
+def add_to_calendar(
+    session_name: str,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    timezone: str = "America/New_York",
+    location: str = "PENN 1, Lifetime Fitness",
+) -> None:
+    """Create a Google Calendar event for a successfully booked session."""
+    if start_dt is None:
+        logger.warning("Cannot add calendar event — start time unknown for: %s", session_name)
+        return
+    if end_dt is None:
+        end_dt = start_dt + timedelta(minutes=90)
+
+    event = {
+        "summary": session_name,
+        "location": location,
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
+        "reminders": {
+            "useDefault": False,
+            "overrides": [{"method": "popup", "minutes": 30}],
+        },
+    }
+
+    try:
+        service = _get_calendar_service()
+        service.events().insert(calendarId="primary", body=event).execute()
+        logger.info("Google Calendar event created: %s on %s", session_name, start_dt.strftime("%Y-%m-%d %I:%M %p"))
+    except Exception as e:
+        logger.warning("Failed to create Google Calendar event: %s", e)
 
 
 def notify_summary(successes: int, failures: int) -> None:

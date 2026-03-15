@@ -29,6 +29,8 @@ class Config:
     headless: bool
     log_file: str
 
+    calendar_timezone: str
+
     # Derived
     root_dir: Path = field(default_factory=lambda: ROOT)
     storage_state_path: Path = field(default_factory=lambda: ROOT / "storage_state.json")
@@ -63,6 +65,7 @@ def load_config(env_path: Path | None = None, config_path: Path | None = None) -
     booking_horizon_days = int(raw.get("booking_horizon_days", 7))
     headless = bool(raw.get("headless", True))
     log_file = raw.get("log_file", "logs/booking.log")
+    calendar_timezone = raw.get("calendar_timezone", "America/New_York")
 
     if not club_name:
         raise ValueError("club_name must be set in config.yaml")
@@ -87,4 +90,5 @@ def load_config(env_path: Path | None = None, config_path: Path | None = None) -
         booking_horizon_days=booking_horizon_days,
         headless=headless,
         log_file=log_file,
+        calendar_timezone=calendar_timezone,
     )

@@ -21,3 +21,4 @@ session_exclusions:              # Skip sessions matching any of these (case-ins
 booking_horizon_days: 9          # How many days ahead to look
 headless: true                   # Set to false to watch the browser
 log_file: logs/booking.log
+calendar_timezone: America/New_York
