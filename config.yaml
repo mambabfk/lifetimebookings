@@ -1,0 +1,13 @@
+club_name: "Bloomington"        # Match your club name as shown on the site
+sport: pickleball
+preferred_days:                  # Days of week to target
+  - monday
+  - wednesday
+  - friday
+preferred_times:                 # Times to try (24h format)
+  - "07:00"
+  - "08:00"
+  - "18:00"
+booking_horizon_days: 7          # How many days ahead to look
+headless: true                   # Set to false to watch the browser
+log_file: logs/booking.log

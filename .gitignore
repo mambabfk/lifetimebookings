@@ -1,0 +1,18 @@
+# Credentials
+.env
+storage_state.json
+
+# Logs
+logs/*.log
+logs/cron.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store

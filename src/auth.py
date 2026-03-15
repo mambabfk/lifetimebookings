@@ -1,0 +1,111 @@
+"""Login to my.lifetime.life and persist browser session."""
+
+from __future__ import annotations
+
+import logging
+import time
+import random
+from pathlib import Path
+from typing import Optional
+
+from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+
+from .config import Config
+
+logger = logging.getLogger(__name__)
+
+LOGIN_URL = "https://my.lifetime.life/login.html"
+
+
+def _random_delay(lo: float = 0.5, hi: float = 1.5) -> None:
+    time.sleep(random.uniform(lo, hi))
+
+
+def _do_login(page: Page, email: str, password: str) -> bool:
+    """Fill login form and submit. Returns True on success."""
+    logger.info("Navigating to login page...")
+    page.goto(LOGIN_URL, wait_until="networkidle")
+    _random_delay()
+
+    # Fill email
+    email_selector = 'input[type="email"], input[name="email"], input[id*="email"]'
+    page.wait_for_selector(email_selector, timeout=15000)
+    page.fill(email_selector, email)
+    _random_delay(0.3, 0.7)
+
+    # Fill password
+    password_selector = 'input[type="password"], input[name="password"], input[id*="password"]'
+    page.fill(password_selector, password)
+    _random_delay(0.3, 0.8)
+
+    # Submit
+    submit_selector = 'button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")'
+    page.click(submit_selector)
+
+    # Wait for navigation or error
+    try:
+        page.wait_for_url(lambda url: "login" not in url, timeout=15000)
+        logger.info("Login successful.")
+        return True
+    except Exception:
+        # Check for error message on page
+        error_text = page.locator('[class*="error"], [class*="alert"], [role="alert"]').first
+        if error_text.is_visible():
+            msg = error_text.inner_text()
+            logger.error(f"Login failed: {msg}")
+        else:
+            logger.error("Login failed: did not redirect away from login page.")
+        return False
+
+
+def get_authenticated_context(cfg: Config, playwright_instance=None) -> tuple:
+    """
+    Return (playwright, browser, context, page) with an authenticated session.
+
+    Reuses storage_state.json if it exists and the session is still valid.
+    Falls back to a fresh login and saves the new state.
+
+    The caller is responsible for closing the browser when done.
+    """
+    pw = playwright_instance or sync_playwright().start()
+    browser: Browser = pw.chromium.launch(headless=cfg.headless)
+
+    storage_path: Path = cfg.storage_state_path
+
+    if storage_path.exists():
+        logger.info("Loading saved session from %s", storage_path)
+        context: BrowserContext = browser.new_context(storage_state=str(storage_path))
+        page: Page = context.new_page()
+
+        # Quick check — try to reach a protected page
+        try:
+            page.goto("https://my.lifetime.life/", wait_until="networkidle", timeout=15000)
+            if "login" not in page.url.lower():
+                logger.info("Existing session is valid.")
+                return pw, browser, context, page
+            else:
+                logger.info("Saved session expired, re-logging in.")
+        except Exception as e:
+            logger.warning("Session check failed (%s), re-logging in.", e)
+
+        page.close()
+        context.close()
+
+    # Fresh login
+    context = browser.new_context()
+    page = context.new_page()
+    success = _do_login(page, cfg.email, cfg.password)
+
+    if not success:
+        page.close()
+        context.close()
+        browser.close()
+        if playwright_instance is None:
+            pw.stop()
+        raise RuntimeError("Authentication failed. Check your credentials in .env.")
+
+    # Persist session
+    context.storage_state(path=str(storage_path))
+    logger.info("Session saved to %s", storage_path)
+
+    return pw, browser, context, page
