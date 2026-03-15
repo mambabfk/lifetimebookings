@@ -15,6 +15,9 @@ session_exclusions:              # Skip sessions matching any of these (case-ins
   - "3.5-4.0"
   - "3.5/4.0"
   - "3.5 - 4.0"
-booking_horizon_days: 8          # How many days ahead to look
+  - "4.25+"
+  - "4.5+"
+  - "4.75+"
+booking_horizon_days: 9          # How many days ahead to look
 headless: true                   # Set to false to watch the browser
 log_file: logs/booking.log

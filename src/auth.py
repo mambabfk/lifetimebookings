@@ -11,6 +11,7 @@ from typing import Optional
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 from .config import Config
+from .utils import dismiss_cookie_popup
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ def _do_login(page: Page, email: str, password: str) -> bool:
     """Fill login form and submit. Returns True on success."""
     logger.info("Navigating to login page...")
     page.goto(LOGIN_URL, wait_until="networkidle")
+    dismiss_cookie_popup(page)
     _random_delay()
 
     # Fill username/email — Lifetime uses name="username" / id="account-username"
@@ -80,6 +82,7 @@ def get_authenticated_context(cfg: Config, playwright_instance=None) -> tuple:
         # Quick check — try to reach a protected page
         try:
             page.goto("https://my.lifetime.life/", wait_until="networkidle", timeout=15000)
+            dismiss_cookie_popup(page)
             if "login" not in page.url.lower():
                 logger.info("Existing session is valid.")
                 return pw, browser, context, page

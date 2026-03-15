@@ -12,6 +12,7 @@ from typing import List, Optional, Set, Tuple
 from playwright.sync_api import Locator, Page
 
 from .config import Config
+from .utils import dismiss_cookie_popup
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +101,30 @@ def _parse_session_start(session_text: str, target_date: date) -> Optional[datet
 
 def _is_future_session(session_text: str, target_date: date) -> bool:
     """
-    Fix 1: Return True only if the session hasn't started yet.
-    If the start time can't be parsed, assume future (don't block it).
+    Return True only if the session starts at least 2 hours from now.
+    If the start time can't be parsed, assume eligible (don't block it).
     """
     start_dt = _parse_session_start(session_text, target_date)
     if start_dt is None:
         logger.debug("Could not parse start time from: %s", session_text[:60])
         return True  # give benefit of the doubt
-    return start_dt > datetime.now()
+    return start_dt >= datetime.now() + timedelta(days=7, hours=22)
+
+
+def _is_allowed_time(session_text: str, target_date: date) -> bool:
+    """
+    Return False for weekday (Mon-Fri) sessions that start between 10:30 AM and 5:00 PM.
+    Weekend sessions and sessions outside that window are always allowed.
+    If the start time can't be parsed, assume allowed.
+    """
+    if target_date.weekday() >= 5:  # Saturday=5, Sunday=6
+        return True
+    start_dt = _parse_session_start(session_text, target_date)
+    if start_dt is None:
+        return True
+    blocked_start = start_dt.replace(hour=10, minute=30, second=0, microsecond=0)
+    blocked_end = start_dt.replace(hour=17, minute=0, second=0, microsecond=0)
+    return not (blocked_start <= start_dt < blocked_end)
 
 
 def _target_dates(cfg: Config) -> List[date]:
@@ -137,6 +154,7 @@ def _fetch_existing_reservations(page: Page) -> Set[str]:
     reserved: Set[str] = set()
     try:
         page.goto(_reservations_url(), wait_until="networkidle", timeout=20000)
+        dismiss_cookie_popup(page)
         _time.sleep(1)
 
         # Grab all reservation entries — selector TBD after inspecting the page
@@ -198,6 +216,7 @@ def _navigate_to_date(page: Page, cfg: Config, target_date: date) -> bool:
     logger.info("Loading schedule for %s: %s", target_date, url)
     try:
         page.goto(url, wait_until="networkidle", timeout=20000)
+        dismiss_cookie_popup(page)
         _time.sleep(1)
         return True
     except Exception as e:
@@ -205,27 +224,17 @@ def _navigate_to_date(page: Page, cfg: Config, target_date: date) -> bool:
         return False
 
 
-def _select_day(page: Page, target_date: date) -> bool:
+def _day_column_index(page: Page, target_date: date) -> int:
     """
-    Click the day radio for target_date to filter the week view to that day.
-    The radio inputs are visually hidden, so we use JS to click them.
+    Return the 0-based index of the .day column for target_date by matching
+    the radio input values, which are ordered the same as the .day divs.
+    Returns -1 if not found.
     """
     date_str = target_date.strftime("%Y-%m-%d")
-    try:
-        clicked = page.evaluate(f"""() => {{
-            const radio = document.querySelector('.planner-date-radio-input[value="{date_str}"]');
-            if (!radio) return false;
-            radio.click();
-            return true;
-        }}""")
-        if clicked:
-            _time.sleep(0.5)
-            return True
-        logger.warning("Day radio not found for %s", date_str)
-        return False
-    except Exception as e:
-        logger.warning("Could not click day radio for %s: %s", date_str, e)
-        return False
+    return page.evaluate(f"""() => {{
+        const radios = [...document.querySelectorAll('.planner-date-radio-input')];
+        return radios.findIndex(r => r.value === '{date_str}');
+    }}""")
 
 
 def _find_matching_sessions(
@@ -233,83 +242,129 @@ def _find_matching_sessions(
     cfg: Config,
     target_date: date,
     existing_reservations: Set[str],
-) -> List[Tuple[str, Locator]]:
+) -> List[Tuple[str, str]]:
     """
-    Return (session_name, reserve_button) for every session on the page that:
+    Return (session_name, details_url) for every session on the page that:
+      - belongs to the target_date day column
       - matches a keyword (with exclusions)
-      - has a "Reserve" CTA (not Waitlist / Cancel / already-reserved)
+      - has a "Reserve" CTA link (not Waitlist / Cancel)
       - hasn't already started (Fix 1)
       - isn't already in existing_reservations (Fix 2)
     """
-    matches: List[Tuple[str, Locator]] = []
+    matches: List[Tuple[str, str]] = []
 
-    try:
-        entries = page.locator('[data-testid="classCell"]').all()
-        logger.debug("Found %d session entries on page", len(entries))
+    # Scope to the correct day column so we never pick up sessions from other days
+    day_idx = _day_column_index(page, target_date)
+    if day_idx == -1:
+        logger.warning("Day column not found for %s — skipping", target_date)
+        return matches
 
-        for entry in entries:
-            try:
-                session_text = entry.inner_text().strip()
-                session_lower = session_text.lower()
+    day_col = page.locator(".calendar .day").nth(day_idx)
+    entries = day_col.locator('[data-testid="classCell"]').all()
+    logger.debug("Day column %d for %s: %d entries", day_idx, target_date, len(entries))
 
-                # Keyword match
-                if not _session_matches(session_lower, cfg):
-                    continue
+    for entry in entries:
+        try:
+            session_text = entry.inner_text().strip()
+            session_lower = session_text.lower()
 
-                # Fix 1: skip sessions that have already started
-                if not _is_future_session(session_text, target_date):
-                    logger.debug("Skipping past session: %s", session_text[:60])
-                    continue
-
-                # Only book if the CTA says exactly "Reserve" — not Waitlist, Cancel, etc.
-                cta = entry.locator(".card-cta").first
-                if not cta.is_visible():
-                    continue
-                cta_text = cta.inner_text().strip()
-                if cta_text.lower() != "reserve":
-                    logger.debug("Skipping (CTA=%r): %s", cta_text, session_text[:60])
-                    continue
-
-                # Fix 2: skip if already reserved
-                session_name = session_text.split("\n")[0].strip()
-                if _already_reserved(session_name, existing_reservations):
-                    logger.info("Already reserved, skipping: %s", session_name)
-                    continue
-
-                logger.info("Found bookable session: %s", session_name)
-                matches.append((session_name, cta))
-
-            except Exception:
+            # Keyword match
+            if not _session_matches(session_lower, cfg):
                 continue
 
-    except Exception as e:
-        logger.debug("Error scanning sessions: %s", e)
+            # Fix 1: skip sessions that have already started
+            if not _is_future_session(session_text, target_date):
+                logger.debug("Skipping past session: %s", session_text[:60])
+                continue
+
+            # Skip weekday sessions between 10:30 AM and 5:00 PM
+            if not _is_allowed_time(session_text, target_date):
+                logger.debug("Skipping daytime weekday session: %s", session_text[:60])
+                continue
+
+            # Get details URL from reserveLink or classLink (classLink is always
+            # present, even before the booking window opens — lets us pre-navigate)
+            link = entry.locator('[data-testid="reserveLink"], [data-testid="classLink"]').first
+            if not link.is_visible():
+                continue
+            details_url = link.get_attribute("href") or ""
+            if not details_url:
+                continue
+            if not details_url.startswith("http"):
+                details_url = "https://my.lifetime.life" + details_url
+
+            # Extract session title
+            title_el = entry.locator(".planner-entry-title").first
+            if title_el.count() > 0:
+                session_name = title_el.inner_text().strip()
+            else:
+                lines = [l.strip() for l in session_text.split("\n") if l.strip()]
+                session_name = next((l for l in lines if not _TIME_RE.match(l)), lines[0] if lines else session_text[:60])
+
+            # Fix 2: skip if already reserved
+            if _already_reserved(session_name, existing_reservations):
+                logger.info("Already reserved, skipping: %s", session_name)
+                continue
+
+            logger.info("Found bookable session: %s", session_name)
+            matches.append((session_name, details_url))
+
+        except Exception:
+            continue
 
     return matches
 
 
-def _confirm_booking(page: Page) -> bool:
-    """Click through the confirmation modal after pressing Reserve."""
+def _book_on_details_page(page: Page, details_url: str, poll_timeout_seconds: int = 300) -> bool:
+    """
+    Navigate to the class details page, wait for the Reserve button to become
+    available (polls up to poll_timeout_seconds), then click it immediately.
+
+    Pre-navigating here before the booking window opens means we're waiting at
+    the door — the moment "Reserve" appears we click it, beating bots that
+    navigate from scratch.
+    """
     try:
-        confirm_btn = page.locator(
-            'button:has-text("Confirm"), button:has-text("Complete"), '
-            'button:has-text("Yes"), [class*="confirm"]'
-        ).first
-        confirm_btn.wait_for(state="visible", timeout=8000)
-        confirm_btn.click()
-        _time.sleep(1)
+        page.goto(details_url, wait_until="networkidle", timeout=20000)
+        dismiss_cookie_popup(page)
+        _time.sleep(0.5)
 
-        success = page.locator(
-            '[class*="success"], [class*="confirmation"], '
-            ':has-text("confirmed"), :has-text("booked")'
-        ).first
-        if success.is_visible(timeout=5000):
-            return True
+        # Ensure Tim (first participant) is checked
+        checkboxes = page.locator('[data-testid="participantCheckBox"]').all()
+        if checkboxes and not any(cb.is_checked() for cb in checkboxes):
+            checkboxes[0].check()
+            _time.sleep(0.2)
 
-        logger.warning("No success indicator found after confirmation.")
+        # Poll for a visible "Reserve" button (not "Add to Waitlist")
+        # Reload every 2 seconds to pick up server-side state changes
+        deadline = _time.monotonic() + poll_timeout_seconds
+        logger.info("    Waiting for Reserve button (up to %ds)...", poll_timeout_seconds)
+
+        while _time.monotonic() < deadline:
+            btns = page.locator('[data-testid="reserveButton"]').all()
+            for btn in btns:
+                try:
+                    if btn.is_visible() and btn.is_enabled() and btn.inner_text().strip().lower() == "reserve":
+                        logger.info("    Reserve button available — clicking now.")
+                        btn.click()
+                        _time.sleep(2)
+                        if "/account/reservations" in page.url:
+                            return True
+                        logger.warning("Unexpected URL after booking: %s", page.url)
+                        return False
+                except Exception:
+                    continue
+
+            # Not available yet — reload and try again
+            _time.sleep(2)
+            page.reload(wait_until="networkidle", timeout=15000)
+            dismiss_cookie_popup(page)
+
+        logger.warning("Reserve button never became available within %ds.", poll_timeout_seconds)
         return False
+
     except Exception as e:
-        logger.warning("Confirmation step failed: %s", e)
+        logger.warning("Details-page booking failed: %s", e)
         return False
 
 
@@ -341,16 +396,13 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
         if not _navigate_to_date(page, cfg, target_date):
             continue
 
-        if not _select_day(page, target_date):
-            logger.warning("Could not filter to day %s, proceeding anyway.", target_date)
-
         sessions = _find_matching_sessions(page, cfg, target_date, existing_reservations)
 
         if not sessions:
             logger.info("  %s — no bookable sessions found.", target_date)
             continue
 
-        for session_name, reserve_btn in sessions:
+        for session_name, details_url in sessions:
             if dry_run:
                 results.append(BookingResult(
                     target_date=target_date,
@@ -363,10 +415,7 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False) -> List[BookingRe
                 continue
 
             logger.info("  Booking %s — %s...", target_date, session_name)
-            reserve_btn.click()
-            _time.sleep(0.8)
-
-            booked = _confirm_booking(page)
+            booked = _book_on_details_page(page, details_url)
             results.append(BookingResult(
                 target_date=target_date,
                 session_name=session_name,
