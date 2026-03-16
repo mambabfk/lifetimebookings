@@ -70,7 +70,16 @@ def get_authenticated_context(cfg: Config, playwright_instance=None) -> tuple:
     The caller is responsible for closing the browser when done.
     """
     pw = playwright_instance or sync_playwright().start()
-    browser: Browser = pw.chromium.launch(headless=cfg.headless)
+    if cfg.headless:
+        browser: Browser = pw.chromium.launch(headless=True)
+    else:
+        # Use installed Chrome so the window appears and focuses like a normal browser
+        browser: Browser = pw.chromium.launch(
+            headless=False,
+            channel="chrome",
+            slow_mo=300,  # slow actions down slightly so they're visible
+            args=["--start-maximized"],
+        )
 
     storage_path: Path = cfg.storage_state_path
 

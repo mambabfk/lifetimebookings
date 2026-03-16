@@ -45,6 +45,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Lifetime Fitness Pickleball Auto-Booker")
     parser.add_argument("--headed", action="store_true", help="Run browser in non-headless mode (for debugging)")
     parser.add_argument("--dry-run", action="store_true", help="Find available slots but do not book")
+    parser.add_argument("--test", action="store_true", help="E2E test: book the first matching session found, ignoring booking window and time-of-day filters")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -87,7 +88,7 @@ def main() -> int:
                 return 1
 
             try:
-                results = book_slots(page, cfg, dry_run=args.dry_run)
+                results = book_slots(page, cfg, dry_run=args.dry_run, test_mode=args.test)
             finally:
                 browser.close()
 
