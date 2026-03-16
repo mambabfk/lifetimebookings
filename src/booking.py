@@ -13,7 +13,6 @@ from typing import List, Optional, Set, Tuple
 from playwright.sync_api import Page
 
 from .config import Config
-from .notifier import add_to_calendar
 from .utils import dismiss_cookie_popup
 
 logger = logging.getLogger(__name__)
@@ -106,13 +105,14 @@ def _session_open_time(session_text: str, target_date: date) -> Optional[datetim
 
 
 def _is_in_booking_window(session_text: str, target_date: date) -> bool:
-    """True if the booking window is open or opens within the next 10 minutes."""
+    """True if the booking window opens within the next 10 minutes (but hasn't opened yet),
+    so the script can sleep to T-2 and fire at exactly T-0."""
     start_dt = _parse_session_start(session_text, target_date)
     if start_dt is None:
-        return True
+        return False
     now = datetime.now()
     booking_open_time = start_dt - timedelta(days=7, hours=22)
-    return (booking_open_time - timedelta(minutes=10)) <= now < start_dt
+    return (booking_open_time - timedelta(minutes=10)) <= now < booking_open_time
 
 
 def _is_allowed_time(session_text: str, target_date: date) -> bool:
@@ -575,9 +575,6 @@ def book_slots(
         if booked:
             logger.info("  SUCCESS: %s — %s", target_date, session_name)
             existing_reservations.add(session_name.lower())
-            start_dt = _parse_session_start(session_text, target_date)
-            end_dt = _parse_session_end(session_text, target_date)
-            add_to_calendar(session_name, start_dt, end_dt, timezone=cfg.calendar_timezone)
         else:
             logger.warning("  FAILED: %s — %s", target_date, session_name)
 
