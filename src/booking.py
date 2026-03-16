@@ -410,23 +410,27 @@ def _try_click_reserve(page: Page) -> bool:
             logger.warning("    Unexpected URL after click: %s", page.url)
             return False
 
-        # Look for a Finish/Done/Close button to complete the pending reservation
-        finish_btn = page.locator(
+        # Find the confirmation button — differs by flow:
+        #   Reserve flow  → "Finish"
+        #   Waitlist flow → "Join Waitlist"
+        confirm_btn = page.locator(
             'button:has-text("Finish"), a:has-text("Finish"), '
+            'button:has-text("Join Waitlist"), a:has-text("Join Waitlist"), '
             'button:has-text("Done"), a:has-text("Done")'
         ).first
         try:
-            finish_btn.wait_for(state="visible", timeout=5000)
-            logger.info("    Clicking Finish button.")
-            finish_btn.evaluate("el => el.click()")
+            confirm_btn.wait_for(state="visible", timeout=5000)
+            confirm_text = confirm_btn.inner_text().strip()
+            logger.info("    Clicking confirmation button: '%s'", confirm_text)
+            confirm_btn.evaluate("el => el.click()")
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
-            logger.info("    URL after Finish: %s", page.url)
+            logger.info("    URL after confirmation: %s", page.url)
         except Exception:
-            # No Finish button — reservation confirmed automatically
-            logger.info("    No Finish button needed — reservation confirmed.")
+            # No confirmation button — completed automatically
+            logger.info("    No confirmation button needed — completed automatically.")
 
         return True
 
