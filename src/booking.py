@@ -354,7 +354,7 @@ def _execute_booking(page: Page, session_name: str, target_date: date) -> bool:
 
         reserve_btn = page.wait_for_selector(
             '[data-testid="reserveButton"]',
-            state="visible",
+            state="attached",
             timeout=8000,
         )
         btn_text = reserve_btn.inner_text().strip()
