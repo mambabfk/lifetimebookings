@@ -106,13 +106,13 @@ def _session_open_time(session_text: str, target_date: date) -> Optional[datetim
 
 
 def _is_in_booking_window(session_text: str, target_date: date) -> bool:
-    """True if the booking window is already open and the session hasn't started."""
+    """True if the booking window is open or opens within the next 10 minutes."""
     start_dt = _parse_session_start(session_text, target_date)
     if start_dt is None:
         return True
     now = datetime.now()
     booking_open_time = start_dt - timedelta(days=7, hours=22)
-    return booking_open_time <= now < start_dt
+    return (booking_open_time - timedelta(minutes=10)) <= now < start_dt
 
 
 def _is_allowed_time(session_text: str, target_date: date) -> bool:
