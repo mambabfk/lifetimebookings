@@ -1,9 +1,10 @@
-"""Discover available pickleball sessions and book them by keyword."""
+"""Discover and book pickleball sessions on Lifetime Fitness."""
 
 from __future__ import annotations
 
 import logging
 import re
+import subprocess
 import time as _time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -25,12 +26,6 @@ DAY_NAMES = {
 # "7:00 to 8:30 AM"  or  "10:00 AM to 12:00 PM"
 _TIME_RE = re.compile(
     r"(\d{1,2}:\d{2})\s*(?:(AM|PM)\s+)?to\s+(\d{1,2}:\d{2})\s*(AM|PM)",
-    re.IGNORECASE,
-)
-
-# "Registration will be open on March 15th at 7:00 PM"
-_REG_OPENS_RE = re.compile(
-    r"registration will be open on (\w+\s+\d+)(?:st|nd|rd|th)?\s+at\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
     re.IGNORECASE,
 )
 
@@ -70,7 +65,6 @@ def _reservations_url() -> str:
 # ---------------------------------------------------------------------------
 
 def _session_matches(session_text: str, cfg: Config) -> bool:
-    """Return True if session_text matches a keyword and passes all exclusions."""
     text = session_text.lower()
     for excl in cfg.session_exclusions:
         if excl in text:
@@ -97,34 +91,33 @@ def _parse_session_end(session_text: str, target_date: date) -> Optional[datetim
     m = _TIME_RE.search(session_text)
     if not m:
         return None
-    end_time_str, end_ampm = m.group(3), m.group(4)
     try:
         return datetime.strptime(
-            f"{target_date} {end_time_str} {end_ampm.upper()}", "%Y-%m-%d %I:%M %p"
+            f"{target_date} {m.group(3)} {m.group(4).upper()}", "%Y-%m-%d %I:%M %p"
         )
     except ValueError:
         return None
 
 
+def _session_open_time(session_text: str, target_date: date) -> Optional[datetime]:
+    """Return the datetime when booking opens: session_start - 7d22h."""
+    start = _parse_session_start(session_text, target_date)
+    return (start - timedelta(days=7, hours=22)) if start else None
+
+
 def _is_in_booking_window(session_text: str, target_date: date) -> bool:
-    """
-    Return True if:
-      - the session hasn't started yet, AND
-      - the booking window has already opened (session is within 8 days)
-    Sessions more than 8 days out haven't opened for booking yet.
-    """
+    """True if the booking window is already open and the session hasn't started."""
     start_dt = _parse_session_start(session_text, target_date)
     if start_dt is None:
-        return True  # can't determine — let the detail page decide
+        return True
     now = datetime.now()
     booking_open_time = start_dt - timedelta(days=7, hours=22)
-    # Window must be open (booking_open_time <= now) and session not yet started
     return booking_open_time <= now < start_dt
 
 
 def _is_allowed_time(session_text: str, target_date: date) -> bool:
-    """Return False for weekday sessions that start between 10:30 AM and 5:00 PM."""
-    if target_date.weekday() >= 5:  # Saturday=5, Sunday=6
+    """False for weekday sessions starting between 10:30 AM and 5:00 PM."""
+    if target_date.weekday() >= 5:
         return True
     start_dt = _parse_session_start(session_text, target_date)
     if start_dt is None:
@@ -153,19 +146,16 @@ def _fetch_existing_reservations(page: Page) -> Set[str]:
     try:
         page.goto(_reservations_url(), wait_until="networkidle", timeout=20000)
         dismiss_cookie_popup(page)
-
-        entries = page.locator(
+        for el in page.locator(
             '[data-testid*="reservation"], [class*="reservation-item"], '
             '[class*="my-reservation"], [class*="upcoming-reservation"]'
-        ).all()
-        for el in entries:
+        ).all():
             try:
                 text = el.inner_text().strip().lower()
                 if text:
                     reserved.add(text)
             except Exception:
                 continue
-
         if not reserved:
             for el in page.locator('[class*="card"], [class*="item"]').all():
                 try:
@@ -174,7 +164,6 @@ def _fetch_existing_reservations(page: Page) -> Set[str]:
                         reserved.add(text)
                 except Exception:
                     continue
-
         logger.info("Found %d existing reservation(s).", len(reserved))
     except Exception as e:
         logger.warning("Could not fetch existing reservations: %s", e)
@@ -226,23 +215,18 @@ def _find_matching_sessions(
 ) -> List[Tuple[str, str, str]]:
     """Return (session_name, details_url, session_text) for every bookable session."""
     matches: List[Tuple[str, str, str]] = []
-
     day_idx = _day_column_index(page, target_date)
     if day_idx == -1:
         logger.warning("Day column not found for %s — skipping", target_date)
         return matches
-
     day_col = page.locator(".calendar .day").nth(day_idx)
     entries = day_col.locator('[data-testid="classCell"]').all()
     logger.debug("Day column %d for %s: %d entries", day_idx, target_date, len(entries))
-
     for entry in entries:
         try:
             session_text = entry.inner_text().strip()
-
             if not _session_matches(session_text.lower(), cfg):
                 continue
-
             if not test_mode:
                 if not _is_in_booking_window(session_text, target_date):
                     logger.debug("Skipping — booking window not yet open: %s", session_text[:60])
@@ -250,8 +234,6 @@ def _find_matching_sessions(
                 if not _is_allowed_time(session_text, target_date):
                     logger.debug("Skipping — weekday daytime: %s", session_text[:60])
                     continue
-
-            # classLink is always present even before the booking window opens
             link = entry.locator('[data-testid="reserveLink"], [data-testid="classLink"]').first
             if not link.is_visible():
                 continue
@@ -260,7 +242,6 @@ def _find_matching_sessions(
                 continue
             if not details_url.startswith("http"):
                 details_url = "https://my.lifetime.life" + details_url
-
             title_el = entry.locator(".planner-entry-title").first
             if title_el.count() > 0:
                 session_name = title_el.inner_text().strip()
@@ -270,42 +251,22 @@ def _find_matching_sessions(
                     (l for l in lines if not _TIME_RE.match(l)),
                     lines[0] if lines else session_text[:60],
                 )
-
             if _already_reserved(session_name, existing_reservations):
                 logger.info("Already reserved, skipping: %s", session_name)
                 continue
-
             logger.info("Found bookable session: %s", session_name)
             matches.append((session_name, details_url, session_text))
-
         except Exception:
             continue
-
     return matches
 
 
 # ---------------------------------------------------------------------------
-# Participant selection + spinner wait
+# Participant selection
 # ---------------------------------------------------------------------------
 
-def _wait_for_spinner(page: Page, timeout_ms: int = 5000) -> None:
-    """Wait for any loading spinner to disappear before interacting with the page."""
-    try:
-        page.wait_for_selector(
-            '[class*="spinner"], [class*="loading"], [class*="loader"]',
-            state="hidden",
-            timeout=timeout_ms,
-        )
-    except Exception:
-        pass  # no spinner found or already gone
-
-
 def _select_participant(page: Page) -> None:
-    """
-    Ensure Tim is checked and Mark is unchecked.
-    Only acts on checkboxes that are in the wrong state — avoids
-    dispatching events that could reset a pre-selected form.
-    """
+    """Ensure Tim is checked and Mark is unchecked."""
     for cb in page.locator('[data-testid="participantCheckBox"]').all():
         try:
             label = cb.evaluate("""el => {
@@ -313,7 +274,6 @@ def _select_participant(page: Page) -> None:
                 return label ? label.innerText.trim() : '';
             }""").lower()
             is_checked = cb.is_checked()
-
             if "tim" in label:
                 if not is_checked:
                     cb.evaluate("""el => {
@@ -323,7 +283,7 @@ def _select_participant(page: Page) -> None:
                     }""")
                     logger.debug("Selected participant: Tim")
                 else:
-                    logger.debug("Participant Tim already selected — leaving as-is")
+                    logger.debug("Participant Tim already selected.")
             elif "mark" in label and is_checked:
                 cb.evaluate("""el => {
                     el.checked = false;
@@ -336,195 +296,223 @@ def _select_participant(page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Registration open time detection
+# Login check
 # ---------------------------------------------------------------------------
 
-def _get_registration_open_time(page: Page) -> Optional[datetime]:
+def _is_logged_in(page: Page) -> bool:
     """
-    If the page shows a 'Registration will be open on [date] at [time]' banner,
-    parse and return that datetime. Returns None if banner is absent or unparseable.
+    Navigate to the reservations page and confirm the session is fully authenticated.
+    Checks both URL (no redirect to /login) and absence of a 'Log In' button,
+    catching partially-expired sessions that pass the URL check but fail on class pages.
     """
     try:
-        banner = page.locator(':text("Registration will be open")').first
-        if not banner.is_visible(timeout=500):
-            return None
-        text = banner.inner_text()
-        m = _REG_OPENS_RE.search(text)
-        if not m:
-            return None
-        date_str = m.group(1).strip()   # e.g. "March 15"
-        time_str = m.group(2).strip()   # e.g. "7:00 PM"
-        return datetime.strptime(
-            f"{date_str} {datetime.now().year} {time_str}", "%B %d %Y %I:%M %p"
-        )
+        page.goto(_reservations_url(), wait_until="networkidle", timeout=15000)
+        dismiss_cookie_popup(page)
+        if "login" in page.url.lower():
+            return False
+        login_btn = page.locator('a:has-text("Log In"), button:has-text("Log In")').first
+        return not login_btn.is_visible(timeout=2000)
     except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Class detail page booking
-# ---------------------------------------------------------------------------
-
-def _try_click_reserve(page: Page) -> bool:
-    """
-    Wait for spinner, verify Tim is selected, then click Reserve if available.
-    Returns True if booking confirmed, False otherwise.
-    """
-    _wait_for_spinner(page)
-    _select_participant(page)
-    # Prefer Reserve over Waitlist — collect all buttons and sort by priority
-    reserve_btn = None
-    waitlist_btn = None
-    for btn in page.locator('[data-testid="reserveButton"]').all():
-        try:
-            text = btn.inner_text().strip().lower()
-            if text == "reserve" and reserve_btn is None:
-                reserve_btn = btn
-            elif "waitlist" in text and waitlist_btn is None:
-                waitlist_btn = btn
-        except Exception:
-            continue
-
-    target = reserve_btn or waitlist_btn
-    if target is None:
         return False
 
+
+# ---------------------------------------------------------------------------
+# macOS notification
+# ---------------------------------------------------------------------------
+
+def _notify_macos(session_name: str, target_date: date, booked: bool = True) -> None:
+    status = "Booked" if booked else "Waitlisted"
+    msg = f"{target_date.strftime('%a %b %-d')} — {session_name}"
+    title = f"Lifetime {status} ✓"
     try:
-        text = target.inner_text().strip()
-        logger.info("    Clicking button: '%s'", text)
-        target.evaluate("el => el.click()")
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{msg}" with title "{title}" sound name "Glass"'],
+            timeout=3,
+        )
+        logger.info("Notification sent: %s — %s", title, msg)
+    except Exception as e:
+        logger.debug("Notification failed: %s", e)
 
-        # Wait for navigation away from the class details page (up to 15s)
-        try:
-            page.wait_for_url(
-                lambda url: "/account/reservations" in url,
-                timeout=15000,
-            )
-        except Exception:
-            pass
 
-        logger.info("    URL after click: %s", page.url)
+# ---------------------------------------------------------------------------
+# Steps 9–11: Reserve → Finish (called after landing on detail page)
+# ---------------------------------------------------------------------------
 
-        # If we didn't land on the reservation page at all, something went wrong
-        if "/account/reservations" not in page.url:
-            logger.warning("    Unexpected URL after click: %s", page.url)
-            return False
+def _execute_booking(page: Page, session_name: str, target_date: date) -> bool:
+    """
+    Step 9:  Wait for detail page load, select Tim, click Reserve or Add to Waitlist.
+    Step 10: Wait for pending reservation page, click Finish or Join Waitlist.
+    Step 11: Confirm #registrationConfirmation, send macOS notification.
 
-        # Find the confirmation button — differs by flow:
-        #   Reserve flow  → "Finish"
-        #   Waitlist flow → "Join Waitlist"
-        confirm_btn = page.locator(
+    All clicks use JavaScript (no mouse simulation overhead).
+    """
+    try:
+        # Step 9 — detail page
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        _select_participant(page)
+
+        reserve_btn = page.wait_for_selector(
+            '[data-testid="reserveButton"]',
+            state="visible",
+            timeout=8000,
+        )
+        btn_text = reserve_btn.inner_text().strip()
+        logger.info("    Step 9 — clicking: '%s'", btn_text)
+        reserve_btn.evaluate("el => el.click()")
+
+        # Step 10 — pending reservation page
+        page.wait_for_url(lambda url: "/account/reservations" in url, timeout=15000)
+        logger.info("    Step 10 — reservation page: %s", page.url)
+
+        confirm_btn = page.wait_for_selector(
             'button:has-text("Finish"), a:has-text("Finish"), '
             'button:has-text("Join Waitlist"), a:has-text("Join Waitlist"), '
-            'button:has-text("Done"), a:has-text("Done")'
-        ).first
-        try:
-            confirm_btn.wait_for(state="visible", timeout=5000)
-            confirm_text = confirm_btn.inner_text().strip()
-            logger.info("    Clicking confirmation button: '%s'", confirm_text)
-            confirm_btn.evaluate("el => el.click()")
-            try:
-                page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
-            logger.info("    URL after confirmation: %s", page.url)
-        except Exception:
-            # No confirmation button — completed automatically
-            logger.info("    No confirmation button needed — completed automatically.")
+            'button:has-text("Done"), a:has-text("Done")',
+            state="visible",
+            timeout=5000,
+        )
+        confirm_text = confirm_btn.inner_text().strip()
+        logger.info("    Step 10 — clicking: '%s'", confirm_text)
+        confirm_btn.evaluate("el => el.click()")
 
+        # Step 11 — confirm
+        page.wait_for_load_state("networkidle", timeout=8000)
+        logger.info("    Step 11 — final URL: %s", page.url)
+
+        booked = "waitlist" not in confirm_text.lower()
+        _notify_macos(session_name, target_date, booked=booked)
         return True
 
     except Exception as e:
-        logger.warning("    _try_click_reserve error: %s", e)
+        logger.warning("    Booking execution failed: %s", e)
         return False
 
 
-def _book_on_details_page(
+# ---------------------------------------------------------------------------
+# Main booking flow for a single session
+# ---------------------------------------------------------------------------
+
+def _book_session(
     page: Page,
+    cfg: Config,
+    session_name: str,
     details_url: str,
-    open_time: Optional[datetime] = None,
-    poll_timeout_seconds: int = 300,
+    session_text: str,
+    target_date: date,
 ) -> bool:
     """
-    Booking strategy:
-    1. Navigate to the class detail page and select Tim.
-    2. Sleep until 3 seconds before the booking window opens.
-    3. Enter a tight reload loop with no delays — hammering the page so we catch
-       the Reserve button the instant the server enables it.
-    4. Click Reserve → handle Pending Reservation → click Finish.
+    Optimized booking flow:
 
-    Starting 3s early ensures we are mid-reload at the exact open moment,
-    not starting a reload after it. No reactive wait — Lifetime's pages are
-    server-rendered and do not update the button state without a reload.
+    1.  Calculate open_time = session_start - 7d22h
+    2.  Sleep quietly until T-2 minutes (browser completely idle)
+    3.  Verify still logged in — re-login immediately if not
+    4.  Navigate to detail page, verify Tim is selected
+    5.  Navigate to schedule page, get fully loaded
+    6.  Locate and hold the class link element on the schedule page
+    7.  Sleep until exactly T-0 (browser idle, no requests)
+    8.  T-0: instant JS click on class link → browser navigates to detail page
+    9.  Instant JS click Reserve (or Add to Waitlist)
+    10. Instant JS click Finish (or Join Waitlist)
+    11. Confirm complete + macOS notification
     """
-    try:
-        page.goto(details_url, wait_until="networkidle", timeout=20000)
+    from .auth import _do_login  # local import to avoid circular dependency
+
+    open_time = _session_open_time(session_text, target_date)
+
+    if open_time:
+        # ── Step 2: sleep until T-2 ──────────────────────────────────────
+        t_minus_2 = open_time - timedelta(minutes=2)
+        wait_secs = (t_minus_2 - datetime.now()).total_seconds()
+        if wait_secs > 0:
+            logger.info(
+                "Step 2 — sleeping %.0fs until T-2 (%s). Browser idle.",
+                wait_secs, t_minus_2.strftime("%I:%M:%S %p"),
+            )
+            _time.sleep(wait_secs)
+
+        # ── Step 3: verify login ──────────────────────────────────────────
+        logger.info("Step 3 — verifying session at T-2...")
+        if not _is_logged_in(page):
+            logger.warning("Session expired — re-logging in...")
+            if not _do_login(page, cfg.email, cfg.password):
+                logger.error("Re-login failed — aborting.")
+                return False
+            logger.info("Re-login successful.")
+
+        # ── Step 4: verify Tim on detail page ────────────────────────────
+        logger.info("Step 4 — verifying participant selection...")
+        page.goto(details_url, wait_until="domcontentloaded", timeout=10000)
         dismiss_cookie_popup(page)
         _select_participant(page)
 
-        # If the window is already open, book immediately
-        if _try_click_reserve(page):
-            return True
+        # ── Steps 5–6: schedule page + locate class link ──────────────────
+        logger.info("Step 5 — loading schedule page...")
+        page.goto(_classes_url(cfg, target_date), wait_until="networkidle", timeout=20000)
+        dismiss_cookie_popup(page)
 
-        if open_time is not None:
-            wait_secs = (open_time - datetime.now()).total_seconds()
-            if wait_secs > poll_timeout_seconds:
-                logger.info(
-                    "    Registration opens in %.0fs — beyond poll timeout, skipping.",
-                    wait_secs,
-                )
-                return False
+        day_idx = _day_column_index(page, target_date)
+        class_link = None
 
-            # Sleep until 3 seconds before open — wake up early so a reload is
-            # already in flight the moment the server flips to "Reserve"
-            wake_secs = max(0.0, wait_secs - 3.0)
-            if wake_secs > 0:
-                logger.info(
-                    "    Sleeping %.0fs — waking at %s (3s before open).",
-                    wake_secs,
-                    (open_time - timedelta(seconds=3)).strftime("%I:%M:%S %p"),
-                )
-                _time.sleep(wake_secs)
+        if day_idx != -1:
+            day_col = page.locator(".calendar .day").nth(day_idx)
+            for entry in day_col.locator('[data-testid="classCell"]').all():
+                try:
+                    if session_name.lower() in entry.inner_text().lower():
+                        link = entry.locator(
+                            '[data-testid="reserveLink"], [data-testid="classLink"]'
+                        ).first
+                        if link.count() > 0:
+                            class_link = link
+                            break
+                except Exception:
+                    continue
+
+        if class_link is None:
+            logger.warning("Step 6 — class link not found; will navigate directly at T-0.")
+
+        logger.info("Step 6 — schedule page ready. Waiting for T-0...")
+
+        # ── Step 7: sleep until T-0 ───────────────────────────────────────
+        wait_secs = (open_time - datetime.now()).total_seconds()
+        if wait_secs > 0:
             logger.info(
-                "    Rapid reload loop started — open time %s.",
-                open_time.strftime("%I:%M:%S %p"),
+                "Step 7 — sleeping %.3fs until T-0 (%s).",
+                wait_secs, open_time.strftime("%I:%M:%S %p"),
             )
+            _time.sleep(wait_secs)
 
-        # Tight reload loop — no sleep between attempts.
-        # Stop after 30s past open_time; if Reserve hasn't appeared by then it won't.
-        deadline_mono = _time.monotonic() + 30
-        attempt = 0
-        while _time.monotonic() < deadline_mono:
-            attempt += 1
-            page.goto(details_url, wait_until="domcontentloaded", timeout=8000)
-            logger.debug("    Reload #%d @ %s", attempt, datetime.now().strftime("%H:%M:%S.%f")[:-3])
-            if _try_click_reserve(page):
-                logger.info("    Booked on reload #%d.", attempt)
-                return True
+        # ── Step 8: T-0 — instant click ───────────────────────────────────
+        logger.info("Step 8 — T-0: clicking class link...")
+        if class_link is not None:
+            class_link.evaluate("el => el.click()")
+        else:
+            # Fallback: direct navigation
+            page.goto(details_url, wait_until="domcontentloaded", timeout=10000)
 
-        logger.warning("    Reserve button did not appear within 30s of open time.")
-        return False
+    else:
+        # Booking window already open — navigate directly
+        logger.info("Booking window already open — navigating to detail page.")
+        page.goto(details_url, wait_until="domcontentloaded", timeout=10000)
+        dismiss_cookie_popup(page)
 
-    except Exception as e:
-        logger.warning("Details-page booking failed: %s", e)
-        return False
+    # Steps 9–11
+    return _execute_booking(page, session_name, target_date)
 
 
 # ---------------------------------------------------------------------------
 # Main booking loop
 # ---------------------------------------------------------------------------
 
-def book_slots(page: Page, cfg: Config, dry_run: bool = False, test_mode: bool = False) -> List[BookingResult]:
+def book_slots(
+    page: Page,
+    cfg: Config,
+    dry_run: bool = False,
+    test_mode: bool = False,
+) -> List[BookingResult]:
     """
-    Two-phase execution:
-
-    Phase 1 — Discovery (fast, schedule pages only):
-      Scan every target date, collect all bookable sessions and their open times.
-      The browser then goes completely idle — no further requests are made.
-
-    Phase 2 — Sleep until 60s before the earliest registration opens, then book:
-      Navigate to each class detail page and use wait_for_function to react the
-      millisecond the Reserve button becomes clickable.
+    Phase 1 — Discovery: scan schedule pages, collect all bookable sessions.
+    Phase 2 — Booking: for each session (sorted by open time), run full flow.
     """
     results: List[BookingResult] = []
     targets = _target_dates(cfg)
@@ -533,36 +521,31 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False, test_mode: bool =
         logger.info("No target dates found within the booking horizon.")
         return results
 
-    # ------------------------------------------------------------------
     # Phase 1: Discovery
-    # ------------------------------------------------------------------
     existing_reservations = _fetch_existing_reservations(page)
-    all_sessions: List[Tuple[date, str, str, str]] = []  # (date, name, url, text)
+    all_sessions: List[Tuple[date, str, str, str]] = []
 
     for target_date in targets:
         logger.info("Checking %s (%s)...", target_date, target_date.strftime("%A"))
-
         if not _navigate_to_date(page, cfg, target_date):
             continue
-
-        sessions = _find_matching_sessions(page, cfg, target_date, existing_reservations, test_mode=test_mode)
-
+        sessions = _find_matching_sessions(
+            page, cfg, target_date, existing_reservations, test_mode=test_mode
+        )
         if not sessions:
             logger.info("  %s — no bookable sessions found.", target_date)
             continue
-
         for session_name, details_url, session_text in sessions:
             all_sessions.append((target_date, session_name, details_url, session_text))
             if test_mode:
-                break  # only need the first match for an e2e test
-
+                break
         if test_mode and all_sessions:
-            break  # stop scanning once we have one session to test with
+            break
 
     if not all_sessions:
         return results
 
-    # Dry-run: report and exit without booking
+    # Dry-run: report and exit
     if dry_run:
         for target_date, session_name, _, _ in all_sessions:
             results.append(BookingResult(
@@ -575,51 +558,24 @@ def book_slots(page: Page, cfg: Config, dry_run: bool = False, test_mode: bool =
             logger.info("  [DRY RUN] %s — available: %s", target_date, session_name)
         return results
 
-    # ------------------------------------------------------------------
-    # Sleep until 60 seconds before the earliest registration opens.
-    # Registration for a session opens at: session_start - 7 days - 22 hours.
-    # The browser is completely idle during this wait — no requests made.
-    # ------------------------------------------------------------------
-    open_times = []
-    for target_date, _, _, session_text in all_sessions:
-        start_dt = _parse_session_start(session_text, target_date)
-        if start_dt is not None:
-            open_times.append(start_dt - timedelta(days=7, hours=22))
+    # Phase 2: sort by open time, book each session
+    all_sessions.sort(
+        key=lambda s: _session_open_time(s[3], s[0]) or datetime.max
+    )
 
-    if open_times:
-        earliest_open = min(open_times)
-        wake_time = earliest_open - timedelta(seconds=60)
-        wait_secs = (wake_time - datetime.now()).total_seconds()
-
-        if wait_secs > 0:
-            logger.info(
-                "Discovery complete. Registration opens at %s. "
-                "Browser idle — sleeping %.0fs until %s (60s early).",
-                earliest_open.strftime("%Y-%m-%d %I:%M:%S %p"),
-                wait_secs,
-                wake_time.strftime("%I:%M:%S %p"),
-            )
-            _time.sleep(wait_secs)
-            logger.info("Waking up — navigating to class detail pages now.")
-
-    # ------------------------------------------------------------------
-    # Phase 2: Booking
-    # ------------------------------------------------------------------
     for target_date, session_name, details_url, session_text in all_sessions:
-        logger.info("  Booking %s — %s...", target_date, session_name)
-        start_dt = _parse_session_start(session_text, target_date)
-        open_time = (start_dt - timedelta(days=7, hours=22)) if start_dt else None
-        booked = _book_on_details_page(page, details_url, open_time=open_time)
+        logger.info("Booking %s — %s...", target_date, session_name)
+        booked = _book_session(page, cfg, session_name, details_url, session_text, target_date)
         results.append(BookingResult(
             target_date=target_date,
             session_name=session_name,
             success=booked,
             message="Booking confirmed." if booked else "Booking failed.",
         ))
-
         if booked:
             logger.info("  SUCCESS: %s — %s", target_date, session_name)
             existing_reservations.add(session_name.lower())
+            start_dt = _parse_session_start(session_text, target_date)
             end_dt = _parse_session_end(session_text, target_date)
             add_to_calendar(session_name, start_dt, end_dt, timezone=cfg.calendar_timezone)
         else:

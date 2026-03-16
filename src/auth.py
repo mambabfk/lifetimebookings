@@ -88,13 +88,19 @@ def get_authenticated_context(cfg: Config, playwright_instance=None) -> tuple:
         context: BrowserContext = browser.new_context(storage_state=str(storage_path))
         page: Page = context.new_page()
 
-        # Validate session against a protected page — the homepage is publicly
-        # accessible and would pass even with expired cookies.
+        # Validate session: load reservations page, then confirm we're actually
+        # authenticated by checking for a "Log In" button. A partially-expired
+        # session can load the reservations page without redirecting to /login
+        # but still shows "Log in to Reserve" on class pages.
         try:
             page.goto("https://my.lifetime.life/account/my-reservations.html",
                       wait_until="networkidle", timeout=15000)
             dismiss_cookie_popup(page)
-            if "login" not in page.url.lower():
+            logged_in = (
+                "login" not in page.url.lower()
+                and not page.locator('a:has-text("Log In"), button:has-text("Log In")').first.is_visible(timeout=2000)
+            )
+            if logged_in:
                 logger.info("Existing session is valid.")
                 return pw, browser, context, page
             else:
