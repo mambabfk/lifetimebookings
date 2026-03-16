@@ -349,14 +349,13 @@ def _execute_booking(page: Page, session_name: str, target_date: date) -> bool:
     """
     try:
         # Step 9 — detail page
-        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        page.wait_for_load_state("networkidle", timeout=15000)
         _select_participant(page)
 
-        reserve_btn = page.wait_for_selector(
-            '[data-testid="reserveButton"]',
-            state="attached",
-            timeout=8000,
-        )
+        # Wait for the registration spinner to finish loading before clicking
+        page.wait_for_selector('[data-testid="sectionSpinner"]', state="hidden", timeout=15000)
+
+        reserve_btn = page.locator('[data-testid="reserveButton"]').first
         btn_text = reserve_btn.inner_text().strip()
         logger.info("    Step 9 — clicking: '%s'", btn_text)
         reserve_btn.evaluate("el => el.click()")
@@ -369,7 +368,7 @@ def _execute_booking(page: Page, session_name: str, target_date: date) -> bool:
             'button:has-text("Finish"), a:has-text("Finish"), '
             'button:has-text("Join Waitlist"), a:has-text("Join Waitlist"), '
             'button:has-text("Done"), a:has-text("Done")',
-            state="visible",
+            state="attached",
             timeout=5000,
         )
         confirm_text = confirm_btn.inner_text().strip()
