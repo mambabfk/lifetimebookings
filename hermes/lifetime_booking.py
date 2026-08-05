@@ -22,8 +22,17 @@ bot API when TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are configured.
     lifetime_booking.py check           # environment self-test (run on the box)
     lifetime_booking.py selftest        # offline logic tests, safe anywhere
     lifetime_booking.py login-test      # verify credentials + save session
+    lifetime_booking.py notify-test     # send a Telegram test message
+    lifetime_booking.py listen          # Telegram command loop (tick auto-starts it)
     lifetime_booking.py dry-run         # find pending targets on the schedule, no booking
     lifetime_booking.py book-now --id ab12  # book immediately, ignore open time
+    lifetime_booking.py cancel --id ab12    # cancel the real reservation on the site
+
+Telegram control: point TELEGRAM_BOT_TOKEN at a DEDICATED bot (BotFather), not
+the Hermes bot — two programs cannot poll one token. The listener understands
+plain messages ("8/14 6:30am drill", "status", "plan", "remove ab12",
+"cancel ab12", "on", "off", "help") and replies from the same bot that sends
+booking results and 24h reminders.
 
 Secrets (never synced to git; both names are gitignored):
     ~/.hermes/state/lifetime_booking/.env        LIFETIME_EMAIL / LIFETIME_PASSWORD
@@ -481,6 +490,7 @@ def cmd_cron(state: dict) -> int:
         log("Another tick is already running — exiting.")
         return 0
 
+    ensure_listener()
     now = datetime.now(ET)
     report: list[str] = []
     dirty = False
@@ -533,9 +543,8 @@ def cmd_cron(state: dict) -> int:
             name = t.get("session_name") or t["keyword"] or "pickleball"
             msg = (f"⏰ Pickleball tomorrow: {start.strftime('%a %b %-d %-I:%M %p')} — {name}\n"
                    f"Keeping it: do nothing.\n"
-                   f"To cancel (avoid the $40 no-show fee): tell Hermes "
-                   f"\"cancel my pickleball reservation [{t['id']}]\" or do it at "
-                   f"https://my.lifetime.life/account/my-reservations.html")
+                   f"To cancel (avoid the $40 no-show fee): reply \"cancel {t['id']}\" "
+                   f"or do it at https://my.lifetime.life/account/my-reservations.html")
             print(msg)
             if not notify(msg):
                 log("Reminder could not be delivered to Telegram!")
@@ -550,6 +559,149 @@ def cmd_cron(state: dict) -> int:
         if not notify(text):
             log("Telegram not configured/reachable — report went to stdout only.")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Telegram control listener — dedicated bot, deterministic, no agent involved
+# ---------------------------------------------------------------------------
+
+HELP_TEXT = """🏓 Pickleball booking commands:
+• 8/14 6:30am drill — queue a session (date, time, optional keyword)
+• status — queue + recent results
+• plan — when each target fires
+• remove ab12 — drop a queued target
+• cancel ab12 — cancel the REAL reservation on the site
+• off / on — master switch
+• help — this message"""
+
+
+def tg_api(token: str, method: str, params: dict, timeout: int = 70) -> dict:
+    import urllib.parse
+    import urllib.request
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=urllib.parse.urlencode(params).encode())
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def handle_message(text: str) -> str:
+    """Route one incoming Telegram message; return the reply text."""
+    import contextlib
+    import io
+    from argparse import Namespace
+
+    def capture(fn, *fn_args) -> str:
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                fn(*fn_args)
+        except Exception as e:  # noqa: BLE001 — reply must never crash the loop
+            print(f"❌ {e}", file=buf)
+        return buf.getvalue().strip() or "✅ done"
+
+    low = text.strip().lower()
+    state = load_state()
+    if low in ("help", "/help", "/start"):
+        return HELP_TEXT
+    if low in ("status", "queue", "queued", "/status"):
+        return capture(cmd_status, state)
+    if low in ("plan", "/plan"):
+        return capture(cmd_plan, state)
+    if low in ("on", "enable"):
+        return capture(cmd_toggle, state, True)
+    if low in ("off", "disable"):
+        return capture(cmd_toggle, state, False)
+    m = re.fullmatch(r"(?:remove|rm|drop)\s+\[?([0-9a-f]{4})\]?", low)
+    if m:
+        return capture(cmd_remove, state, Namespace(id=m.group(1), all=False))
+    m = re.fullmatch(r"cancel\s+\[?([0-9a-f]{4})\]?", low)
+    if m:
+        return capture(cmd_cancel, state, Namespace(id=m.group(1), headed=False))
+    try:
+        parse_spec(text, datetime.now(ET))
+    except ValueError:
+        return "🤷 Didn't understand that.\n\n" + HELP_TEXT
+    return capture(cmd_add, state,
+                   Namespace(spec=text.split(), date=None, time=None, keyword=None))
+
+
+def ensure_listener() -> None:
+    """Start the Telegram listener if it isn't running (called by every tick)."""
+    import fcntl
+    import subprocess
+    env = read_env()
+    if not env.get("TELEGRAM_BOT_TOKEN") or not env.get("TELEGRAM_CHAT_ID"):
+        return
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    probe = open(BASE_DIR / "listen.lock", "a")
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe, fcntl.LOCK_UN)
+    except OSError:
+        probe.close()
+        return  # already running
+    probe.close()
+    logf = open(BASE_DIR / "listen.log", "a")
+    subprocess.Popen([sys.executable or "python3", str(Path(__file__).resolve()), "listen"],
+                     stdout=logf, stderr=logf, start_new_session=True)
+    log("Spawned Telegram listener.")
+
+
+def cmd_listen() -> int:
+    import fcntl
+    env = read_env()
+    token = env.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = env.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        print(f"❌ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set in {ENV_PATH}")
+        return 1
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(BASE_DIR / "listen.lock", "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("Listener already running — exiting.")
+        return 0
+
+    offset_path = BASE_DIR / "telegram_offset"
+    offset = int(offset_path.read_text()) if offset_path.exists() else 0
+    log("Telegram listener started.")
+    while True:
+        try:
+            resp = tg_api(token, "getUpdates", {"timeout": 50, "offset": offset})
+        except Exception as e:  # noqa: BLE001
+            if "409" in str(e):
+                log("409 Conflict: something else is polling this bot token "
+                    "(the Hermes bot?). Use a DEDICATED BotFather bot for booking.")
+                return 1
+            log(f"getUpdates failed: {e} — retrying in 10s")
+            time.sleep(10)
+            continue
+        for upd in resp.get("result", []):
+            offset = upd["update_id"] + 1
+            offset_path.write_text(str(offset))
+            msg = upd.get("message") or {}
+            if str((msg.get("chat") or {}).get("id")) != str(chat_id):
+                continue  # ignore strangers
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            log(f"<< {text}")
+            if re.match(r"(?i)^cancel\s+\[?[0-9a-f]{4}", text):
+                try:
+                    tg_api(token, "sendMessage",
+                           {"chat_id": chat_id,
+                            "text": "🔄 Cancelling on the site — give me a minute..."},
+                           timeout=15)
+                except Exception:
+                    pass
+            reply = handle_message(text)
+            try:
+                tg_api(token, "sendMessage", {"chat_id": chat_id, "text": reply},
+                       timeout=15)
+            except Exception as e:  # noqa: BLE001
+                log(f"Reply failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +1004,16 @@ def cmd_check(state: dict) -> int:
     env = read_env()
     if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
         print("Telegram delivery: configured")
+        import fcntl
+        try:
+            probe = open(BASE_DIR / "listen.lock", "a")
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe, fcntl.LOCK_UN)
+            probe.close()
+            print("⚠️ Telegram listener: not running (the next tick starts it, "
+                  "or run `listen` in the background yourself)")
+        except OSError:
+            print("Telegram listener: running ✅ (text the bot 'status' to try it)")
     else:
         print("⚠️ Telegram delivery not configured — booking results will only reach "
               f"the tick log. Add TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID to {ENV_PATH}")
@@ -1063,9 +1225,6 @@ def cmd_selftest() -> int:
         check("env parse email", env["LIFETIME_EMAIL"] == "a@b.com")
         check("env parse quoted", env["LIFETIME_PASSWORD"] == "p w")
         check("notify no-op when unconfigured", notify("test") is False)
-        ENV_PATH.write_text(ENV_PATH.read_text()
-                            + "TELEGRAM_BOT_TOKEN=tok\nTELEGRAM_CHAT_ID=123\n")
-        check("env parse telegram", read_env()["TELEGRAM_CHAT_ID"] == "123")
         s = load_state()
         check("default enabled", s["enabled"] is True)
         s["targets"].append({"id": "test", "date": "2099-01-04", "time": "19:00",
@@ -1077,6 +1236,25 @@ def cmd_selftest() -> int:
         s3 = load_state()
         check("pending untouched by idle tick",
               s3["targets"][0]["status"] == "pending")
+
+        # Token appended only after the cron test — a tick with a token would
+        # spawn a real listener subprocess, which selftest must never do.
+        ENV_PATH.write_text(ENV_PATH.read_text()
+                            + "TELEGRAM_BOT_TOKEN=tok\nTELEGRAM_CHAT_ID=123\n")
+        check("env parse telegram", read_env()["TELEGRAM_CHAT_ID"] == "123")
+
+        # Telegram message routing (offline — handle_message never sends)
+        check("tg help", handle_message("help") == HELP_TEXT)
+        check("tg off", "OFF" in handle_message("off"))
+        check("tg on", "ON" in handle_message("on"))
+        reply = handle_message("12/25 9:00am drill")
+        check("tg add spec", "Target" in reply and "window opens" in reply)
+        listing = handle_message("status")
+        check("tg status lists it", "drill" in listing)
+        new_id = load_state()["targets"][-1]["id"]
+        check("tg remove", "Removed" in handle_message(f"remove {new_id}"))
+        check("tg garbage -> help",
+              "Didn't understand" in handle_message("hello there"))
     STATE_PATH, BASE_DIR, ENV_PATH, AUTH_PATH = old
 
     print(f"\n{'ALL TESTS PASSED' if not failures else f'{len(failures)} FAILURE(S)'}")
@@ -1097,6 +1275,7 @@ def main() -> int:
     sub.add_parser("selftest")
     sub.add_parser("login-test")
     sub.add_parser("notify-test")
+    sub.add_parser("listen")
     sub.add_parser("dry-run")
     p_timer = sub.add_parser("install-timer")
     p_timer.add_argument("--crontab", action="store_true",
@@ -1146,6 +1325,8 @@ def main() -> int:
         return cmd_install_timer(args)
     if args.cmd == "check":
         return cmd_check(state)
+    if args.cmd == "listen":
+        return cmd_listen()
     if args.cmd == "login-test":
         return cmd_login_test(state)
     if args.cmd == "notify-test":
