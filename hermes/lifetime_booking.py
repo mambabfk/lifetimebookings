@@ -939,6 +939,7 @@ def main() -> int:
     sub.add_parser("check")
     sub.add_parser("selftest")
     sub.add_parser("login-test")
+    sub.add_parser("notify-test")
     sub.add_parser("dry-run")
     p_timer = sub.add_parser("install-timer")
     p_timer.add_argument("--crontab", action="store_true",
@@ -986,6 +987,18 @@ def main() -> int:
         return cmd_check(state)
     if args.cmd == "login-test":
         return cmd_login_test(state)
+    if args.cmd == "notify-test":
+        env = read_env()
+        if not env.get("TELEGRAM_BOT_TOKEN") or not env.get("TELEGRAM_CHAT_ID"):
+            print(f"❌ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set in {ENV_PATH}")
+            return 1
+        if notify("🏓 Lifetime booking — notify test. If you can read this, "
+                  "booking results will reach you."):
+            print("✅ Sent — check your Telegram.")
+            return 0
+        print("❌ Telegram API call failed — token or chat_id is wrong "
+              "(watch stderr above for the error).")
+        return 1
     if args.cmd == "dry-run":
         return cmd_dry_run(state)
     if args.cmd == "book-now":
