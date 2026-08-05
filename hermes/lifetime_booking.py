@@ -48,6 +48,8 @@ WINDOW_BEFORE_START = timedelta(days=7, hours=22)
 # Cron runs every 10 min; anything opening within the next 11 min is "due" so
 # no open time can fall between two ticks.
 LOOKAHEAD = timedelta(minutes=11)
+# Lifetime charges for no-shows — ask 24h ahead whether to keep the session.
+REMIND_BEFORE = timedelta(hours=24)
 
 BASE_DIR = Path(os.environ.get(
     "LIFETIME_BOOKING_DIR", "~/.hermes/state/lifetime_booking")).expanduser()
@@ -169,7 +171,8 @@ def parse_spec(text: str, now: datetime) -> tuple[str, str, str]:
 
     Tokens may appear in any order: one date (M/D, M/D/YY[YY], or YYYY-MM-DD),
     one time (4pm / 4:15pm / 16:00), keyword = everything else. A date without
-    a year resolves to the next future occurrence.
+    a year resolves to the next future occurrence. The keyword is optional —
+    without one, any pickleball session at that time matches.
     """
     # Glue '4 pm' -> '4pm' so time is always one token
     text = re.sub(r"(?i)\b(\d{1,2}(?::\d{2})?)\s+([ap]m)\b", r"\1\2", text.strip())
@@ -198,10 +201,10 @@ def parse_spec(text: str, now: datetime) -> tuple[str, str, str]:
             time_str = tok
             continue
         keyword_parts.append(tok)
-    if not date_str or not time_str or not keyword_parts:
+    if not date_str or not time_str:
         raise ValueError(
-            f"Cannot parse {text!r} — need a date, a time, and a keyword, "
-            "e.g.: 8/11 4pm 4.0+")
+            f"Cannot parse {text!r} — need at least a date and a time, "
+            "e.g.: 8/11 4pm 4.0+ (keyword optional)")
     return date_str, time_str, " ".join(keyword_parts)
 
 
@@ -228,6 +231,17 @@ def classify(target: dict, now: datetime) -> str:
     if now < open_t:
         return "due" if open_t - now <= LOOKAHEAD else "wait"
     return "late"  # window already open; keep trying until the session starts
+
+
+def needs_reminder(target: dict, now: datetime) -> bool:
+    """True when a successfully booked session starts within the next 24h
+    and no keep-or-cancel reminder has been sent yet."""
+    if target.get("status") != "done" or target.get("result") not in ("booked", "waitlisted"):
+        return False
+    if target.get("reminded_at"):
+        return False
+    start = session_start(target)
+    return now < start and (start - now) <= REMIND_BEFORE
 
 
 # ---------------------------------------------------------------------------
@@ -331,12 +345,14 @@ def find_class_link(page, target: dict):
         log(f"  day column not found for {date_str}")
         return None, None, None
     time_label = clock_label(session_start(target))
-    keyword = target["keyword"].lower()
+    keyword = (target.get("keyword") or "").lower()
     day_col = page.locator(".calendar .day").nth(day_idx)
     for entry in day_col.locator('[data-testid="classCell"]').all():
         try:
             text = entry.inner_text().strip()
-            if keyword not in text.lower() or time_label not in text:
+            if time_label not in text:
+                continue
+            if keyword and keyword not in text.lower():
                 continue
             link = entry.locator(
                 '[data-testid="reserveLink"], [data-testid="classLink"]').first
@@ -445,7 +461,8 @@ def run_target(page, context, state: dict, target: dict, snipe: bool) -> tuple[b
 def fmt_target(t: dict, now: datetime) -> str:
     start, open_t = session_start(t), opens_at(t)
     status = t.get("status", "pending")
-    line = (f"[{t['id']}] {start.strftime('%a %b %-d %-I:%M %p')} — {t['keyword']}"
+    line = (f"[{t['id']}] {start.strftime('%a %b %-d %-I:%M %p')} — "
+            f"{t.get('keyword') or 'any'}"
             f" | opens {open_t.strftime('%a %b %-d %-I:%M %p')} | {status}")
     if t.get("result"):
         line += f" ({t['result']})"
@@ -501,13 +518,29 @@ def cmd_cron(state: dict) -> int:
             dirty = True
             start = session_start(t)
             label = start.strftime("%a %b %-d %-I:%M %p")
-            name = t.get("session_name") or t["keyword"]
+            name = t.get("session_name") or t["keyword"] or "pickleball"
             if ok and result == "booked":
                 report.append(f"✅ Booked: {label} — {name}")
             elif ok:
                 report.append(f"🕐 Waitlisted: {label} — {name}")
             else:
                 report.append(f"❌ Booking failed: {label} — {name} ({result})")
+
+    # 24h keep-or-cancel reminders for booked sessions ($40 no-show fee)
+    for t in state["targets"]:
+        if needs_reminder(t, now):
+            start = session_start(t)
+            name = t.get("session_name") or t["keyword"] or "pickleball"
+            msg = (f"⏰ Pickleball tomorrow: {start.strftime('%a %b %-d %-I:%M %p')} — {name}\n"
+                   f"Keeping it: do nothing.\n"
+                   f"To cancel (avoid the $40 no-show fee): tell Hermes "
+                   f"\"cancel my pickleball reservation [{t['id']}]\" or do it at "
+                   f"https://my.lifetime.life/account/my-reservations.html")
+            print(msg)
+            if not notify(msg):
+                log("Reminder could not be delivered to Telegram!")
+            t["reminded_at"] = now.isoformat()
+            dirty = True
 
     if dirty:
         save_state(state)
@@ -517,6 +550,105 @@ def cmd_cron(state: dict) -> int:
         if not notify(text):
             log("Telegram not configured/reachable — report went to stdout only.")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Cancel an existing reservation on the site
+# ---------------------------------------------------------------------------
+
+def cmd_cancel(state: dict, args) -> int:
+    target = next((t for t in state["targets"] if t["id"] == args.id), None)
+    if target is None:
+        print(f"No target with id {args.id}. Run status to list ids.")
+        return 1
+    start = session_start(target)
+    day_pat = f"{start.strftime('%b')} {start.day}"       # "Aug 13"
+    time_pat = clock_label(start)                          # "5:30"
+    label = start.strftime("%a %b %-d %-I:%M %p")
+
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=not args.headed)
+        context = (browser.new_context(storage_state=str(AUTH_PATH))
+                   if AUTH_PATH.exists() else browser.new_context())
+        page = context.new_page()
+        try:
+            if not ensure_logged_in(page, context):
+                print("❌ Login failed — cancel manually: "
+                      "https://my.lifetime.life/account/my-reservations.html")
+                return 1
+
+            def find_card():
+                for el in page.locator(
+                        '[data-testid*="reservation"], [class*="reservation"], '
+                        '[class*="card"]').all():
+                    try:
+                        text = el.inner_text()
+                        if day_pat.lower() in text.lower() and time_pat in text:
+                            return el
+                    except Exception:
+                        continue
+                return None
+
+            page.goto(RESERVATIONS_URL, wait_until="networkidle", timeout=20000)
+            dismiss_cookie_popup(page)
+            card = find_card()
+            if card is None:
+                print(f"❌ Could not find a reservation matching {label} on the "
+                      "reservations page — cancel manually if it exists.")
+                return 1
+            log(f"Found reservation card for {label}")
+
+            # Cancel link either on the card or on its detail page
+            cancel_btn = card.locator(
+                'a:has-text("Cancel"), button:has-text("Cancel")').first
+            if cancel_btn.count() == 0 or not cancel_btn.is_visible():
+                link = card.locator("a").first
+                if link.count() == 0:
+                    print("❌ No cancel control or detail link on the card — cancel manually.")
+                    return 1
+                link.evaluate("el => el.click()")
+                page.wait_for_load_state("networkidle", timeout=15000)
+                cancel_btn = page.locator(
+                    'a:has-text("Cancel"), button:has-text("Cancel")').first
+                if cancel_btn.count() == 0:
+                    print("❌ No cancel control on the detail page — cancel manually.")
+                    return 1
+            log(f"Clicking: {cancel_btn.inner_text().strip()!r}")
+            cancel_btn.evaluate("el => el.click()")
+
+            # Confirmation dialog — click the affirmative, never a bare "No"
+            try:
+                confirm = page.wait_for_selector(
+                    'button:has-text("Yes"), a:has-text("Yes"), '
+                    'button:has-text("Cancel Reservation"), '
+                    'a:has-text("Cancel Reservation"), '
+                    'button:has-text("Confirm"), a:has-text("Confirm")',
+                    state="visible", timeout=8000)
+                log(f"Confirming: {confirm.inner_text().strip()!r}")
+                confirm.evaluate("el => el.click()")
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                log("No confirmation dialog appeared — assuming single-step cancel.")
+
+            # Verify: reload the reservations list, the card should be gone
+            page.goto(RESERVATIONS_URL, wait_until="networkidle", timeout=20000)
+            dismiss_cookie_popup(page)
+            if find_card() is None:
+                target["status"] = "cancelled"
+                target["cancelled_at"] = datetime.now(ET).isoformat()
+                save_state(state)
+                name = target.get("session_name") or target["keyword"] or "pickleball"
+                msg = f"🗑 Cancelled: {label} — {name}"
+                print(msg)
+                notify(msg)
+                return 0
+            print(f"⚠️ Clicked through the cancel flow but {label} still shows on the "
+                  "reservations page — verify manually: "
+                  "https://my.lifetime.life/account/my-reservations.html")
+            return 1
+        finally:
+            browser.close()
 
 
 def cmd_status(state: dict) -> int:
@@ -568,10 +700,10 @@ def cmd_add(state: dict, args) -> int:
         except ValueError as e:
             print(f"❌ {e}")
             return 1
-    elif args.date and args.time and args.keyword:
-        date_str, time_str, keyword = args.date, args.time, args.keyword
+    elif args.date and args.time:
+        date_str, time_str, keyword = args.date, args.time, args.keyword or ""
     else:
-        print("❌ Give a shorthand spec (add 8/11 4pm 4.0+) or --date/--time/--keyword.")
+        print("❌ Give a shorthand spec (add 8/11 4pm 4.0+) or --date/--time [--keyword].")
         return 1
     target = {
         "id": uuid.uuid4().hex[:4],
@@ -594,7 +726,7 @@ def cmd_add(state: dict, args) -> int:
     when = "ALREADY OPEN — next cron tick will book immediately" if open_t <= now \
         else f"window opens {open_t.strftime('%a %b %-d %-I:%M %p')} ET"
     print(f"✅ Target [{target['id']}]: {start.strftime('%a %b %-d %-I:%M %p')} "
-          f"— {keyword}\n   {when}")
+          f"— {keyword or 'any pickleball session at that time'}\n   {when}")
     if not state["enabled"]:
         print("⚠️ Master switch is OFF — run `enable` or it will not fire.")
     return 0
@@ -853,6 +985,8 @@ def cmd_selftest() -> int:
           == ("2026-08-11", "4pm", "open play"))
     check("spec 24h time",
           parse_spec("8/11 16:00 4.0+", fake_now) == ("2026-08-11", "16:00", "4.0+"))
+    check("spec keyword optional",
+          parse_spec("8/14 8:00AM", fake_now) == ("2026-08-14", "8:00AM", ""))
     check("keyword with slash not eaten as date",
           parse_spec("8/11 4pm 3.5/4.0", fake_now) == ("2026-08-11", "4pm", "3.5/4.0"))
     try:
@@ -892,6 +1026,29 @@ def cmd_selftest() -> int:
                  for h in range(24) for m in range(0, 60, 10)]
         firing = [k for k in ticks if classify(tt, k) == "due"]
         check(f"open at :{minute:02d} caught by exactly one tick", len(firing) == 1)
+
+    # Reminder gating
+    booked = {"date": "2026-03-24", "time": "17:30", "keyword": "x",
+              "status": "done", "result": "booked"}
+    start = session_start(booked)
+    check("no reminder 25h before",
+          not needs_reminder(booked, start - timedelta(hours=25)))
+    check("reminder 23h before",
+          needs_reminder(booked, start - timedelta(hours=23)))
+    check("no reminder after start",
+          not needs_reminder(booked, start + timedelta(minutes=1)))
+    check("no reminder when already sent",
+          not needs_reminder({**booked, "reminded_at": "x"},
+                             start - timedelta(hours=23)))
+    check("no reminder for failed booking",
+          not needs_reminder({**booked, "result": "error: x", "status": "failed"},
+                             start - timedelta(hours=23)))
+    check("reminder for waitlisted",
+          needs_reminder({**booked, "result": "waitlisted"},
+                         start - timedelta(hours=23)))
+    check("no reminder for pending",
+          not needs_reminder({**booked, "status": "pending", "result": None},
+                             start - timedelta(hours=23)))
 
     # State round-trip in a sandbox dir
     global STATE_PATH, BASE_DIR, ENV_PATH, AUTH_PATH
@@ -956,6 +1113,10 @@ def main() -> int:
     p_rm.add_argument("--all", action="store_true")
     p_now = sub.add_parser("book-now")
     p_now.add_argument("--id", required=True)
+    p_cancel = sub.add_parser("cancel")
+    p_cancel.add_argument("--id", required=True)
+    p_cancel.add_argument("--headed", action="store_true",
+                          help="show the browser window (recommended for the first cancel)")
     args = parser.parse_args()
 
     if args.cmd == "selftest":
@@ -1003,6 +1164,8 @@ def main() -> int:
         return cmd_dry_run(state)
     if args.cmd == "book-now":
         return cmd_book_now(state, args)
+    if args.cmd == "cancel":
+        return cmd_cancel(state, args)
     parser.print_help()
     return 1
 

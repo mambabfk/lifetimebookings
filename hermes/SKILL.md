@@ -32,6 +32,7 @@ Run with `python3 ~/.hermes/scripts/lifetime_booking.py <command>`.
 | "when will it fire?" | `plan` |
 | "cancel the tuesday one" | `status` to find the id, then `remove --id <id>` |
 | "book it right now, window's already open" | `book-now --id <id>` |
+| "cancel my pickleball reservation [ab12]" (from the 24h reminder) | `cancel --id ab12` — cancels the REAL reservation on the site |
 
 Notes:
 - `add` takes shorthand directly: a date (`8/11`, `3/24/27`, or ISO), a time
@@ -47,6 +48,14 @@ Notes:
 - Booking results (booked / waitlisted / failed) are sent straight to
   Telegram by the tick itself. `status` shows the last few outcomes and
   whether the independent scheduler is armed.
+- **24h keep-or-cancel reminder**: Lifetime charges ~$40 for no-shows, so the
+  tick automatically messages Tim 24 hours before every booked/waitlisted
+  session. If he replies that he wants out, run `cancel --id <id>` (the id is
+  in the reminder). `cancel` clicks through the real cancellation flow on
+  my.lifetime.life and verifies the reservation disappeared; if it reports
+  anything other than 🗑 Cancelled, tell Tim to cancel manually at
+  https://my.lifetime.life/account/my-reservations.html. If he says keep (or
+  says nothing), do nothing.
 
 ## One-time setup (if not done yet)
 
