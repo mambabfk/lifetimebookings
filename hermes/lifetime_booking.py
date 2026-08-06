@@ -217,6 +217,81 @@ def parse_spec(text: str, now: datetime) -> tuple[str, str, str]:
     return date_str, time_str, " ".join(keyword_parts)
 
 
+WEEKDAYS = {"mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1,
+            "wed": 2, "weds": 2, "wednesday": 2,
+            "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+            "fri": 4, "friday": 4, "sat": 5, "saturday": 5, "sun": 6, "sunday": 6}
+BULK_FILLER = {"all", "of", "the", "a", "session", "sessions", "at", "and",
+               "on", "every", "book", "me", "for", "plus", "times", "time"}
+KEYWORD_ALIASES = {"drilling": "drill", "drills": "drill"}
+
+
+def parse_bulk(text: str, now: datetime) -> list[tuple[str, str, str]] | None:
+    """Expand 'all the drilling sessions next week at 630 and 8' into
+    (date, time, keyword) tuples — every matching day x every listed time.
+
+    Returns None when the text isn't a bulk phrase (no 'week' token or no
+    times). Bare-hour times inherit am/pm from the previous time in the list;
+    a leading bare hour with nothing to inherit from is an error.
+    """
+    toks = re.sub(r"[,;]+", " ", text.strip().lower()).split()
+    if "week" not in toks:
+        return None
+    scope = "next" if "next" in toks else "this"
+    wanted_days = {WEEKDAYS[t] for t in toks if t in WEEKDAYS}
+
+    times: list[str] = []
+    kw_parts: list[str] = []
+    last_was_pm: bool | None = None
+    for tok in toks:
+        if tok in ("week", "next", "this") or tok in WEEKDAYS or tok in BULK_FILLER:
+            continue
+        m = re.fullmatch(r"(\d{1,4})(?::(\d{2}))?(am|pm)?", tok)
+        if not m:
+            kw_parts.append(KEYWORD_ALIASES.get(tok, tok))
+            continue
+        digits, minutes, ampm = m.group(1), m.group(2), m.group(3)
+        if minutes is not None:
+            hour, minute = int(digits), int(minutes)
+        elif len(digits) >= 3:              # compact 630 / 1730
+            hour, minute = int(digits[:-2]), int(digits[-2:])
+        else:
+            hour, minute = int(digits), 0
+            if not ampm:                     # bare hour — inherit meridian
+                if last_was_pm is None:
+                    raise ValueError(
+                        f"Ambiguous time {tok!r} — give the first time with "
+                        "minutes or am/pm (e.g. 6:30 and 8)")
+                if last_was_pm and hour < 12:
+                    hour += 12
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"Time out of range: {tok!r}")
+        last_was_pm = hour >= 12
+        times.append(f"{hour}:{minute:02d}")
+    if not times:
+        return None
+
+    today = now.date()
+    monday = today - timedelta(days=today.weekday())
+    if scope == "next":
+        first, last = monday + timedelta(days=7), monday + timedelta(days=13)
+    else:
+        first, last = today, monday + timedelta(days=6)
+    keyword = " ".join(kw_parts)
+    out = []
+    day = first
+    while day <= last:
+        if not wanted_days or day.weekday() in wanted_days:
+            for tm in times:
+                out.append((day.isoformat(), tm, keyword))
+        day += timedelta(days=1)
+    return out
+
+
 def session_start(target: dict) -> datetime:
     y, mo, d = (int(p) for p in target["date"].split("-"))
     hour, minute = parse_target_time(target["time"])
@@ -519,7 +594,8 @@ def cmd_cron(state: dict) -> int:
                         browser.close()
             except Exception as e:  # noqa: BLE001 — must always record the outcome
                 result = f"error: {e}"
-            t["status"] = "done" if ok else "failed"
+            not_found = not ok and "session not found" in result
+            t["status"] = "done" if ok else ("skipped" if not_found else "failed")
             t["result"] = result
             t["attempted_at"] = now.isoformat()
             state["history"].append({k: t.get(k) for k in
@@ -533,6 +609,9 @@ def cmd_cron(state: dict) -> int:
                 report.append(f"✅ Booked: {label} — {name}")
             elif ok:
                 report.append(f"🕐 Waitlisted: {label} — {name}")
+            elif not_found:
+                report.append(f"⏭ {label}: no session matching "
+                              f"'{t['keyword'] or 'any'}' on the schedule — skipped")
             else:
                 report.append(f"❌ Booking failed: {label} — {name} ({result})")
 
@@ -568,6 +647,7 @@ def cmd_cron(state: dict) -> int:
 HELP_TEXT = """🏓 Pickleball booking commands:
 • 8/14 6:30am drill — queue a session (date, time, optional keyword)
 • several at once: one per line, or comma-separated
+• bulk: "all the drill sessions next week at 630 and 8" (also: this week, mon wed fri)
 • booked — list the reservations actually on your Lifetime account
 • status — queue + recent results
 • plan — when each target fires
@@ -623,6 +703,24 @@ def handle_message(text: str) -> str:
     if low in ("booked", "reservations", "sessions", "my sessions",
                "what's booked", "what have i booked", "/booked"):
         return capture(cmd_booked, state)
+
+    # Bulk pattern: "all the drilling sessions next week at 630 and 8"
+    try:
+        bulk = parse_bulk(text, datetime.now(ET))
+    except ValueError as e:
+        return f"❌ {e}"
+    if bulk:
+        if len(bulk) > 21:
+            return (f"❌ That expands to {len(bulk)} targets — narrow it "
+                    "(specific days, fewer times).")
+        replies = [capture(cmd_add, state,
+                           Namespace(spec=[d, tm] + (kw.split() if kw else []),
+                                     date=None, time=None, keyword=None))
+                   for d, tm, kw in bulk]
+        return (f"📋 Expanded to {len(bulk)} target(s):\n\n"
+                + "\n\n".join(replies)
+                + "\n\nDays with no matching session just get skipped at "
+                  "booking time.")
 
     # One or many booking specs — newline / semicolon / comma separated
     parts = [p.strip() for p in re.split(r"[\n;,]+", text) if p.strip()]
@@ -1233,6 +1331,29 @@ def cmd_selftest() -> int:
         check("reject spec without date", False)
     except ValueError:
         check("reject spec without date", True)
+
+    # Bulk expansion (fake_now = Wed Aug 5 2026; next week = Mon 8/10 – Sun 8/16)
+    bulk = parse_bulk("all of the drilling sessions next week at 630 and 8", fake_now)
+    check("bulk 7 days x 2 times", len(bulk) == 14)
+    check("bulk dates span next week",
+          bulk[0][0] == "2026-08-10" and bulk[-1][0] == "2026-08-16")
+    check("bulk times inherit am", {t for _, t, _ in bulk} == {"6:30", "8:00"})
+    check("bulk keyword drilling->drill", all(kw == "drill" for _, _, kw in bulk))
+    bulk = parse_bulk("drill next week mon wed at 6:30am", fake_now)
+    check("bulk weekday filter",
+          [d for d, _, _ in bulk] == ["2026-08-10", "2026-08-12"])
+    bulk = parse_bulk("next week at 5:30pm and 8", fake_now)
+    check("bulk pm inheritance", {t for _, t, _ in bulk} == {"17:30", "20:00"})
+    bulk = parse_bulk("this week at 6:30", fake_now)
+    check("bulk this week = today..sunday",
+          [d for d, _, _ in bulk] == [f"2026-08-{n:02d}" for n in range(5, 10)])
+    check("non-bulk returns None",
+          parse_bulk("8/14 6:30am drill", fake_now) is None)
+    try:
+        parse_bulk("next week at 8", fake_now)
+        check("bulk bare hour without anchor rejected", False)
+    except ValueError:
+        check("bulk bare hour without anchor rejected", True)
 
     # Open-time math — ground truth from the March one-offs:
     # Mon Mar 23 2026 8:30 PM class opened Sun Mar 15 10:30 PM ET.
