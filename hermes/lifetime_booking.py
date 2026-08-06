@@ -48,7 +48,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -222,29 +222,122 @@ WEEKDAYS = {"mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1,
             "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
             "fri": 4, "friday": 4, "sat": 5, "saturday": 5, "sun": 6, "sunday": 6}
 BULK_FILLER = {"all", "of", "the", "a", "session", "sessions", "at", "and",
-               "on", "every", "book", "me", "for", "plus", "times", "time"}
+               "on", "every", "book", "me", "for", "plus", "times", "time",
+               "i", "want", "you", "to", "please", "schedule", "register",
+               "sign", "up", "go", "ahead", "do", "only", "from", "starting",
+               "start", "between", "day", "days", "daily", "in", "with", "my"}
 KEYWORD_ALIASES = {"drilling": "drill", "drills": "drill"}
+# Words that mark a message as a bulk/range request rather than a single spec
+BULK_TRIGGERS = {"week", "weeks", "weekday", "weekdays", "weekend", "weekends",
+                 "after", "every", "daily"}
 
 
 def parse_bulk(text: str, now: datetime) -> list[tuple[str, str, str]] | None:
-    """Expand 'all the drilling sessions next week at 630 and 8' into
-    (date, time, keyword) tuples — every matching day x every listed time.
+    """Expand a bulk phrase into (date, time, keyword) tuples — every matching
+    day x every listed time.
 
-    Returns None when the text isn't a bulk phrase (no 'week' token or no
-    times). Bare-hour times inherit am/pm from the previous time in the list;
-    a leading bare hour with nothing to inherit from is an error.
+    Understands: next/this week, weekday names, weekdays/weekends,
+    "after the 15th" / "after 8/15", "8/17 to 8/28", "for 2 weeks",
+    times as 5:30pm / 630 / bare hours (which inherit am/pm from the previous
+    time). Returns None when the text has no bulk trigger words or no times.
     """
-    toks = re.sub(r"[,;]+", " ", text.strip().lower()).split()
-    if "week" not in toks:
-        return None
-    scope = "next" if "next" in toks else "this"
-    wanted_days = {WEEKDAYS[t] for t in toks if t in WEEKDAYS}
+    # Strip punctuation, but keep interior periods — "4.0+" is a keyword,
+    # only sentence-edge dots ("weeks.") should go.
+    toks = [t.strip(".") for t in
+            re.sub(r"[,;()!?]+", " ", text.strip().lower()).split()]
+    toks = [t for t in toks if t]
+    if not (set(toks) & BULK_TRIGGERS):
+        # "8/17 to 8/21" is also a bulk range, even with no trigger word
+        if not ({"to", "until", "through"} & set(toks)
+                and any(re.fullmatch(r"\d{1,2}/\d{1,2}", t) for t in toks)):
+            return None
+    today = now.date()
 
+    def parse_md(tok: str) -> date | None:
+        m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", tok)
+        if not m:
+            return None
+        mo, d = int(m.group(1)), int(m.group(2))
+        year = now.year + (1 if (mo, d) < (now.month, now.day) else 0)
+        try:
+            return date(year, mo, d)
+        except ValueError:
+            return None
+
+    def parse_ordinal(tok: str) -> date | None:
+        m = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th)", tok)
+        if not m:
+            return None
+        d = int(m.group(1))
+        base = today if d >= today.day else \
+            (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+        try:
+            return base.replace(day=d)
+        except ValueError:
+            return None
+
+    # Pass 1 — pull out date-range constructs
+    start = end = None
+    span_days = None
+    rest: list[str] = []
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        nxt2 = toks[i + 2] if i + 2 < len(toks) else ""
+        if tok == "after":
+            j = i + 1 + (1 if nxt == "the" else 0)
+            cand = toks[j] if j < len(toks) else ""
+            dt = parse_md(cand) or parse_ordinal(cand)
+            if dt:
+                start = dt + timedelta(days=1)   # "after the 15th" = 16th on
+                i = j + 1
+                continue
+        if tok == "for" and re.fullmatch(r"\d{1,2}", nxt) and nxt2 in ("week", "weeks"):
+            span_days = int(nxt) * 7
+            i += 3
+            continue
+        if re.fullmatch(r"\d{1,2}", tok) and nxt in ("week", "weeks"):
+            span_days = int(tok) * 7
+            i += 2
+            continue
+        if tok in ("to", "until", "through"):
+            dt = parse_md(nxt) or parse_ordinal(nxt)
+            if dt:
+                end = dt
+                i += 2
+                continue
+        dt = parse_md(tok) or parse_ordinal(tok)
+        if dt:
+            if start is None:
+                start = dt
+            elif end is None:
+                end = dt
+            i += 1
+            continue
+        rest.append(tok)
+        i += 1
+
+    # Pass 2 — day filters, times, keyword
+    wanted_days: set[int] = set()
     times: list[str] = []
     kw_parts: list[str] = []
     last_was_pm: bool | None = None
-    for tok in toks:
-        if tok in ("week", "next", "this") or tok in WEEKDAYS or tok in BULK_FILLER:
+    for tok in rest:
+        if tok in WEEKDAYS:
+            wanted_days.add(WEEKDAYS[tok])
+            continue
+        if tok in ("weekday", "weekdays"):
+            wanted_days |= {0, 1, 2, 3, 4}
+            continue
+        if tok in ("weekend", "weekends"):
+            wanted_days |= {5, 6}
+            continue
+        if tok in ("am", "pm"):
+            raise ValueError(
+                "I can't discover every AM/PM session myself — list the "
+                "times, e.g. 'drill at 6:30 and 8 after the 15th for 2 weeks'")
+        if tok in ("week", "weeks", "next", "this") or tok in BULK_FILLER:
             continue
         m = re.fullmatch(r"(\d{1,4})(?::(\d{2}))?(am|pm)?", tok)
         if not m:
@@ -273,18 +366,31 @@ def parse_bulk(text: str, now: datetime) -> list[tuple[str, str, str]] | None:
         last_was_pm = hour >= 12
         times.append(f"{hour}:{minute:02d}")
     if not times:
+        if start or span_days:
+            raise ValueError(
+                "A bulk booking needs at least one time — e.g. 'at 5:30pm'")
         return None
 
-    today = now.date()
+    # Resolve the date range
     monday = today - timedelta(days=today.weekday())
-    if scope == "next":
-        first, last = monday + timedelta(days=7), monday + timedelta(days=13)
-    else:
-        first, last = today, monday + timedelta(days=6)
+    if start is None:
+        if "next" in toks:
+            start = monday + timedelta(days=7)
+        else:
+            start = today
+            if end is None and span_days is None:
+                end = monday + timedelta(days=6)   # rest of this week
+    if end is None:
+        end = start + timedelta(days=(span_days or 7) - 1)
+    if end < start:
+        raise ValueError("That date range ends before it starts.")
+    if (end - start).days > 31:
+        raise ValueError("Range longer than a month — narrow it.")
+
     keyword = " ".join(kw_parts)
     out = []
-    day = first
-    while day <= last:
+    day = start
+    while day <= end:
         if not wanted_days or day.weekday() in wanted_days:
             for tm in times:
                 out.append((day.isoformat(), tm, keyword))
@@ -647,7 +753,8 @@ def cmd_cron(state: dict) -> int:
 HELP_TEXT = """🏓 Pickleball booking commands:
 • 8/14 6:30am drill — queue a session (date, time, optional keyword)
 • several at once: one per line, or comma-separated
-• bulk: "all the drill sessions next week at 630 and 8" (also: this week, mon wed fri)
+• bulk: "all the drill sessions next week at 630 and 8"
+  (also: weekdays / mon wed fri, "after the 15th", "8/17 to 8/28", "for 2 weeks")
 • booked — list the reservations actually on your Lifetime account
 • status — queue + recent results
 • plan — when each target fires
@@ -704,39 +811,49 @@ def handle_message(text: str) -> str:
                "what's booked", "what have i booked", "/booked"):
         return capture(cmd_booked, state)
 
-    # Bulk pattern: "all the drilling sessions next week at 630 and 8"
-    try:
-        bulk = parse_bulk(text, datetime.now(ET))
-    except ValueError as e:
-        return f"❌ {e}"
-    if bulk:
-        if len(bulk) > 21:
-            return (f"❌ That expands to {len(bulk)} targets — narrow it "
-                    "(specific days, fewer times).")
-        replies = [capture(cmd_add, state,
-                           Namespace(spec=[d, tm] + (kw.split() if kw else []),
-                                     date=None, time=None, keyword=None))
-                   for d, tm, kw in bulk]
-        return (f"📋 Expanded to {len(bulk)} target(s):\n\n"
-                + "\n\n".join(replies)
-                + "\n\nDays with no matching session just get skipped at "
-                  "booking time.")
-
-    # One or many booking specs — newline / semicolon / comma separated
-    parts = [p.strip() for p in re.split(r"[\n;,]+", text) if p.strip()]
-    replies = []
-    for part in parts:
+    def try_add(clause: str) -> str | None:
+        """Bulk or plain add for one clause; None when it isn't an add."""
         try:
-            parse_spec(part, datetime.now(ET))
-        except ValueError:
-            if len(parts) == 1:
-                return "🤷 Didn't understand that.\n\n" + HELP_TEXT
-            replies.append(f"❌ {part!r} — needs at least a date and a time")
-            continue
-        replies.append(capture(
-            cmd_add, state,
-            Namespace(spec=part.split(), date=None, time=None, keyword=None)))
-    return "\n\n".join(replies) if replies else HELP_TEXT
+            bulk = parse_bulk(clause, datetime.now(ET))
+        except ValueError as e:
+            return f"❌ {e}"
+        if bulk:
+            if len(bulk) > 30:
+                return (f"❌ That expands to {len(bulk)} targets — narrow it "
+                        "(specific days, fewer times, shorter range).")
+            replies = [capture(cmd_add, state,
+                               Namespace(spec=[d, tm] + (kw.split() if kw else []),
+                                         date=None, time=None, keyword=None))
+                       for d, tm, kw in bulk]
+            return (f"📋 Expanded to {len(bulk)} target(s):\n\n"
+                    + "\n\n".join(replies)
+                    + "\n\nDays with no matching session just get skipped at "
+                      "booking time.")
+        # One or many plain specs — newline / semicolon / comma separated
+        parts = [p.strip() for p in re.split(r"[\n;,]+", clause) if p.strip()]
+        replies = []
+        for part in parts:
+            try:
+                parse_spec(part, datetime.now(ET))
+            except ValueError:
+                if len(parts) == 1:
+                    return None
+                replies.append(f"❌ {part!r} — needs at least a date and a time")
+                continue
+            replies.append(capture(
+                cmd_add, state,
+                Namespace(spec=part.split(), date=None, time=None, keyword=None)))
+        return "\n\n".join(replies) if replies else None
+
+    # "…and all the…" chains two requests — handle each clause separately
+    clauses = [c.strip(" ,.;") for c in
+               re.split(r"(?i)\band\s+(?:also\s+|all\s+)", text) if c.strip(" ,.;")]
+    if len(clauses) > 1:
+        return "\n\n———\n\n".join(
+            try_add(c) or f"🤷 Couldn't parse: {c!r}" for c in clauses)
+    reply = try_add(text)
+    return reply if reply is not None else \
+        "🤷 Didn't understand that.\n\n" + HELP_TEXT
 
 
 def ensure_listener() -> None:
@@ -1355,6 +1472,32 @@ def cmd_selftest() -> int:
     except ValueError:
         check("bulk bare hour without anchor rejected", True)
 
+    # Ranges: "after the 15th", "for 2 weeks", weekdays (fake_now = Wed Aug 5)
+    bulk = parse_bulk("i want you to book all of the 5:30pm 4.0+ sessions "
+                      "on the weekdays after the 15th for 2 weeks", fake_now)
+    check("bulk weekdays after 15th count", len(bulk) == 10)
+    check("bulk weekdays after 15th dates",
+          bulk[0][0] == "2026-08-17" and bulk[-1][0] == "2026-08-28")
+    check("bulk weekdays after 15th time+kw",
+          all(t == "17:30" and k == "4.0+" for _, t, k in bulk))
+    bulk = parse_bulk("drill at 6:30 and 8 every day after the 15th for 2 weeks",
+                      fake_now)
+    check("bulk every day for 2 weeks", len(bulk) == 28
+          and bulk[0][0] == "2026-08-16" and bulk[-1][0] == "2026-08-29")
+    bulk = parse_bulk("4.0+ at 5:30pm 8/17 to 8/21", fake_now)
+    check("bulk explicit m/d range", len(bulk) == 5
+          and bulk[0][0] == "2026-08-17" and bulk[-1][0] == "2026-08-21")
+    try:
+        parse_bulk("all the am drill sessions after the 15th", fake_now)
+        check("bulk bare am gets guidance", False)
+    except ValueError as e:
+        check("bulk bare am gets guidance", "list the times" in str(e))
+    try:
+        parse_bulk("weekdays after the 15th 4.0+", fake_now)
+        check("bulk without any time gets guidance", False)
+    except ValueError as e:
+        check("bulk without any time gets guidance", "at least one time" in str(e))
+
     # Open-time math — ground truth from the March one-offs:
     # Mon Mar 23 2026 8:30 PM class opened Sun Mar 15 10:30 PM ET.
     t = {"date": "2026-03-23", "time": "20:30", "keyword": "x"}
@@ -1465,6 +1608,14 @@ def cmd_selftest() -> int:
               "✅ Target" in reply and "needs at least a date and a time" in reply)
         check("tg multi-add still queues good segment",
               len(load_state()["targets"]) == n_before + 4)
+
+        # Two chained requests, second one unfulfillable ("am" needs times)
+        reply = handle_message(
+            "i want you to book all of the 5:30pm 4.0+ sessions on the "
+            "weekdays after the 15th and all of the am drilling sessions "
+            "after the 15th (only do this for 2 weeks)")
+        check("tg clause 1 queued weekdays", reply.count("✅ Target") == 5)
+        check("tg clause 2 explains am", "list the times" in reply)
     STATE_PATH, BASE_DIR, ENV_PATH, AUTH_PATH = old
 
     print(f"\n{'ALL TESTS PASSED' if not failures else f'{len(failures)} FAILURE(S)'}")
