@@ -567,6 +567,8 @@ def cmd_cron(state: dict) -> int:
 
 HELP_TEXT = """🏓 Pickleball booking commands:
 • 8/14 6:30am drill — queue a session (date, time, optional keyword)
+• several at once: one per line, or comma-separated
+• booked — list the reservations actually on your Lifetime account
 • status — queue + recent results
 • plan — when each target fires
 • remove ab12 — drop a queued target
@@ -618,12 +620,25 @@ def handle_message(text: str) -> str:
     m = re.fullmatch(r"cancel\s+\[?([0-9a-f]{4})\]?", low)
     if m:
         return capture(cmd_cancel, state, Namespace(id=m.group(1), headed=False))
-    try:
-        parse_spec(text, datetime.now(ET))
-    except ValueError:
-        return "🤷 Didn't understand that.\n\n" + HELP_TEXT
-    return capture(cmd_add, state,
-                   Namespace(spec=text.split(), date=None, time=None, keyword=None))
+    if low in ("booked", "reservations", "sessions", "my sessions",
+               "what's booked", "what have i booked", "/booked"):
+        return capture(cmd_booked, state)
+
+    # One or many booking specs — newline / semicolon / comma separated
+    parts = [p.strip() for p in re.split(r"[\n;,]+", text) if p.strip()]
+    replies = []
+    for part in parts:
+        try:
+            parse_spec(part, datetime.now(ET))
+        except ValueError:
+            if len(parts) == 1:
+                return "🤷 Didn't understand that.\n\n" + HELP_TEXT
+            replies.append(f"❌ {part!r} — needs at least a date and a time")
+            continue
+        replies.append(capture(
+            cmd_add, state,
+            Namespace(spec=part.split(), date=None, time=None, keyword=None)))
+    return "\n\n".join(replies) if replies else HELP_TEXT
 
 
 def ensure_listener() -> None:
@@ -688,11 +703,14 @@ def cmd_listen() -> int:
             if not text:
                 continue
             log(f"<< {text}")
-            if re.match(r"(?i)^cancel\s+\[?[0-9a-f]{4}", text):
+            slow = re.match(r"(?i)^(cancel\s+\[?[0-9a-f]{4}|booked|reservations|"
+                            r"sessions|my sessions|what's booked|what have i booked)",
+                            text)
+            if slow:
                 try:
                     tg_api(token, "sendMessage",
                            {"chat_id": chat_id,
-                            "text": "🔄 Cancelling on the site — give me a minute..."},
+                            "text": "🔄 On it — checking the site, give me ~30s..."},
                            timeout=15)
                 except Exception:
                     pass
@@ -702,6 +720,65 @@ def cmd_listen() -> int:
                        timeout=15)
             except Exception as e:  # noqa: BLE001
                 log(f"Reply failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# List the reservations actually on the Lifetime account
+# ---------------------------------------------------------------------------
+
+def cmd_booked(state: dict) -> int:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser, context = open_browser(pw)
+        page = context.new_page()
+        try:
+            if not ensure_logged_in(page, context):
+                print("❌ Login failed — see reservations at "
+                      "https://my.lifetime.life/account/my-reservations.html")
+                return 1
+            page.goto(RESERVATIONS_URL, wait_until="networkidle", timeout=20000)
+            dismiss_cookie_popup(page)
+
+            def clean(raw: str) -> str:
+                lines = [l.strip() for l in raw.split("\n") if l.strip()]
+                joined = " | ".join(lines)
+                return joined[:140] + ("…" if len(joined) > 140 else "")
+
+            items: list[str] = []
+            seen: set[str] = set()
+            for el in page.locator(
+                    '[data-testid*="reservation"], [class*="reservation-item"], '
+                    '[class*="my-reservation"], [class*="upcoming-reservation"]').all():
+                try:
+                    text = el.inner_text().strip()
+                    if text and len(text) < 400 and text.lower() not in seen:
+                        seen.add(text.lower())
+                        items.append(clean(text))
+                except Exception:
+                    continue
+            if not items:  # fallback: generic cards that look like reservations
+                for el in page.locator('[class*="card"], [class*="item"]').all():
+                    try:
+                        text = el.inner_text().strip()
+                        low = text.lower()
+                        if (text and len(text) < 400 and low not in seen
+                                and any(k in low for k in
+                                        ("pickleball", "court", "class", "reservation"))):
+                            seen.add(low)
+                            items.append(clean(text))
+                    except Exception:
+                        continue
+            if not items:
+                print("📅 No upcoming reservations found on your account.")
+            else:
+                print(f"📅 Upcoming reservations on your account ({len(items)}):")
+                for i, item in enumerate(items[:15], 1):
+                    print(f"{i}. {item}")
+                if len(items) > 15:
+                    print(f"…and {len(items) - 15} more: {RESERVATIONS_URL}")
+            return 0
+        finally:
+            browser.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1332,18 @@ def cmd_selftest() -> int:
         check("tg remove", "Removed" in handle_message(f"remove {new_id}"))
         check("tg garbage -> help",
               "Didn't understand" in handle_message("hello there"))
+
+        # Multi-session add: one message, several specs
+        n_before = len(load_state()["targets"])
+        reply = handle_message("12/26 9:00am drill\n12/27 4pm 4.0+, 12/28 10:30am")
+        check("tg multi-add queues all three",
+              len(load_state()["targets"]) == n_before + 3)
+        check("tg multi-add echoes each", reply.count("✅ Target") == 3)
+        reply = handle_message("12/29 8am drill, gibberish here")
+        check("tg multi-add flags bad segment",
+              "✅ Target" in reply and "needs at least a date and a time" in reply)
+        check("tg multi-add still queues good segment",
+              len(load_state()["targets"]) == n_before + 4)
     STATE_PATH, BASE_DIR, ENV_PATH, AUTH_PATH = old
 
     print(f"\n{'ALL TESTS PASSED' if not failures else f'{len(failures)} FAILURE(S)'}")
@@ -1276,6 +1365,7 @@ def main() -> int:
     sub.add_parser("login-test")
     sub.add_parser("notify-test")
     sub.add_parser("listen")
+    sub.add_parser("booked")
     sub.add_parser("dry-run")
     p_timer = sub.add_parser("install-timer")
     p_timer.add_argument("--crontab", action="store_true",
@@ -1341,6 +1431,8 @@ def main() -> int:
         print("❌ Telegram API call failed — token or chat_id is wrong "
               "(watch stderr above for the error).")
         return 1
+    if args.cmd == "booked":
+        return cmd_booked(state)
     if args.cmd == "dry-run":
         return cmd_dry_run(state)
     if args.cmd == "book-now":
